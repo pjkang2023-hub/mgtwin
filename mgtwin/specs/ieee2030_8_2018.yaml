@@ -1,0 +1,249 @@
+edition: "2018"
+source: "IEEE Std 2030.8-2018 (structure only; no normative text reproduced)"
+disclaimer: >
+  Test descriptions below are original summaries written for this harness. Clause
+  references are intentionally blank and must be populated from a licensed copy
+  of the standard. Numeric limits marked limit_source other than "standard" are
+  project or interconnection-agreement values and are placeholders here.
+  P2030.8 is under revision (Active PAR approved 2026-03-26); track the revision
+  before committing a customer deliverable to this edition.
+
+cases:
+  - id: DISP-01
+    function: dispatch
+    title: Steady-state dispatch tracking against a setpoint schedule
+    edition: "2018"
+    clause: ""
+    initial_condition: >
+      Grid-connected, all sources available, load at a defined fraction of
+      microgrid capacity, storage at mid state of charge.
+    initiating_event: >
+      Controller receives a sequence of real and reactive power setpoints at the
+      point of interconnection.
+    measurements: [p_poi_mw, q_poi_mvar, p_per_source_mw, soc_pct]
+    criteria:
+      - metric: poi_p_tracking_error
+        unit: percent_of_setpoint
+        comparator: "<="
+        limit: null
+        limit_source: interconnection_agreement
+      - metric: settling_time
+        unit: s
+        comparator: "<="
+        limit: null
+        limit_source: project
+    requires_island_config: false
+
+  - id: DISP-02
+    function: dispatch
+    title: Dispatch under a source becoming unavailable
+    edition: "2018"
+    clause: ""
+    initial_condition: Grid-connected, dispatching to a setpoint, all sources online.
+    initiating_event: One dispatchable source is removed without warning.
+    measurements: [p_poi_mw, p_per_source_mw, f_hz, v_pu]
+    criteria:
+      - metric: poi_p_deviation_duration
+        unit: s
+        comparator: "<="
+        limit: null
+        limit_source: project
+    requires_island_config: false
+
+  - id: ISL-P-01
+    function: planned_islanding
+    title: Planned transition to island with no loss of load
+    edition: "2018"
+    clause: ""
+    initial_condition: >
+      Grid-connected, import at the point of interconnection reduced toward zero
+      in preparation, grid-forming source online and within its capability.
+    initiating_event: Controller commands the point of interconnection to open.
+    measurements: [f_hz, v_pu, p_poi_mw, p_per_source_mw, breaker_status]
+    criteria:
+      - metric: frequency_nadir_deviation
+        unit: hz
+        comparator: "<="
+        limit: null
+        limit_source: project
+      - metric: voltage_excursion
+        unit: pu
+        comparator: within
+        limit: null
+        limit_source: interconnection_agreement
+      - metric: critical_load_interrupted
+        unit: count
+        comparator: "<="
+        limit: 0.0
+        limit_source: project
+    requires_island_config: true
+
+  - id: ISL-U-01
+    function: unplanned_islanding
+    title: Unplanned island following an upstream trip at full import
+    edition: "2018"
+    clause: ""
+    initial_condition: >
+      Grid-connected at maximum import, grid-forming source online but lightly
+      loaded. This is the worst case and the one most often skipped.
+    initiating_event: Upstream breaker opens without notice.
+    measurements: [f_hz, rocof_hz_s, v_pu, p_per_source_mw, load_shed_mw]
+    criteria:
+      - metric: frequency_nadir_deviation
+        unit: hz
+        comparator: "<="
+        limit: null
+        limit_source: project
+      - metric: rocof_peak
+        unit: hz_s
+        comparator: "<="
+        limit: null
+        limit_source: project
+      - metric: critical_load_interrupted
+        unit: count
+        comparator: "<="
+        limit: 0.0
+        limit_source: project
+    requires_island_config: true
+    notes: >
+      Load shedding is usually required to pass this and its adequacy depends on
+      shed-scheme latency, which is frequently omitted from models.
+
+  - id: REC-01
+    function: reconnection
+    title: Active resynchronisation and reconnection to the utility
+    edition: "2018"
+    clause: ""
+    initial_condition: Stable islanded operation, utility voltage restored and stable.
+    initiating_event: Controller initiates synchronisation and closes the interconnection.
+    measurements: [phase_angle_deg, df_hz, dv_pu, p_poi_mw, breaker_status]
+    criteria:
+      - metric: closing_angle_error
+        unit: deg
+        comparator: "<="
+        limit: null
+        limit_source: standard
+      - metric: closing_frequency_difference
+        unit: hz
+        comparator: "<="
+        limit: null
+        limit_source: standard
+      - metric: closing_voltage_difference
+        unit: pu
+        comparator: "<="
+        limit: null
+        limit_source: standard
+      - metric: inrush_transient
+        unit: pu
+        comparator: "<="
+        limit: null
+        limit_source: project
+    requires_island_config: true
+
+  - id: BLK-01
+    function: black_start
+    title: Black start from a de-energised microgrid
+    edition: "2018"
+    clause: ""
+    initial_condition: Microgrid fully de-energised, storage above minimum state of charge.
+    initiating_event: Controller commands black start and sequences load pickup.
+    measurements: [v_pu, f_hz, inrush_current_a, load_energised_mw, soc_pct]
+    criteria:
+      - metric: energisation_time
+        unit: s
+        comparator: "<="
+        limit: null
+        limit_source: project
+      - metric: voltage_overshoot
+        unit: pu
+        comparator: "<="
+        limit: null
+        limit_source: project
+      - metric: transformer_inrush_vs_converter_limit
+        unit: ratio
+        comparator: "<="
+        limit: 1.0
+        limit_source: project
+    requires_island_config: true
+    notes: >
+      Transformer inrush against a current-limited grid-forming source is the
+      usual black-start failure and it needs EMT, not RMS, to resolve.
+    requires_emt: true
+
+  - id: PROT-01
+    function: protection
+    title: Islanded fault coordination with converter-limited fault current
+    edition: "2018"
+    clause: ""
+    initial_condition: Stable islanded operation on converter sources only.
+    initiating_event: Three-phase and single-line-to-ground faults at defined locations.
+    measurements: [i_fault_a, relay_operate_time_s, v_pu_unfaulted_phases]
+    criteria:
+      - metric: primary_clearing_time
+        unit: s
+        comparator: "<="
+        limit: null
+        limit_source: project
+      - metric: unfaulted_phase_overvoltage
+        unit: pu
+        comparator: "<="
+        limit: null
+        limit_source: project
+    requires_island_config: true
+    requires_emt: true
+    notes: >
+      Cross-reference IEEE Std 2030.12-2025 (published 2025-10-23) for scheme
+      selection. The single-line-to-ground case is where the grounding gate
+      earns its keep.
+
+  - id: PQ-01
+    function: power_quality
+    title: Steady-state power quality in island mode
+    edition: "2018"
+    clause: ""
+    initial_condition: Stable islanded operation across the declared load range.
+    initiating_event: None; sustained observation with the largest motor started.
+    measurements: [thd_v_pct, thd_i_pct, unbalance_pct, flicker_pst, f_hz]
+    criteria:
+      - metric: voltage_thd
+        unit: percent
+        comparator: "<="
+        limit: null
+        limit_source: standard
+      - metric: voltage_unbalance
+        unit: percent
+        comparator: "<="
+        limit: null
+        limit_source: standard
+    requires_island_config: true
+    requires_emt: true
+
+  - id: SS-01
+    function: steady_state
+    title: Voltage and frequency regulation across the island load range
+    edition: "2018"
+    clause: ""
+    initial_condition: Islanded, minimum load.
+    initiating_event: Load ramped from minimum to maximum and back.
+    measurements: [f_hz, v_pu, p_per_source_mw, q_per_source_mvar]
+    criteria:
+      - metric: steady_state_frequency_band
+        unit: hz
+        comparator: within
+        limit: null
+        limit_source: project
+      - metric: steady_state_voltage_band
+        unit: pu
+        comparator: within
+        limit: null
+        limit_source: project
+      - metric: reactive_sharing_error
+        unit: percent
+        comparator: "<="
+        limit: null
+        limit_source: project
+    requires_island_config: true
+    notes: >
+      Reactive sharing error between droop-controlled sources is the classic
+      finding here and depends on feeder impedance, so it is sensitive to the
+      per-unit base errors the units gate screens for.
