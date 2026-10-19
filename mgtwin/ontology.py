@@ -109,6 +109,12 @@ class Transformer(BaseModel):
     r_pu: float = Field(0.0, ge=0.0, description="On own rating")
     hv_config: WindingConfig
     lv_config: WindingConfig
+    inrush_pu: float = Field(
+        10.0, gt=0.0,
+        description="Peak magnetising inrush as a multiple of rated rms current on first "
+                    "energisation (typ. 8-12 for distribution units). Default is ASSUMED; "
+                    "set inrush_identified=True once taken from a test or the nameplate.")
+    inrush_identified: bool = False
 
     def provides_zero_sequence_path_to(self, side: Literal["hv", "lv"]) -> bool:
         """A grounded-wye winding provides a zero-sequence path to its own side."""
@@ -318,6 +324,11 @@ class IslandConfig(BaseModel):
     open_switches: list[str] = Field(default_factory=list)
     grid_connected: bool
     energized_source_ids: list[str] = Field(default_factory=list)
+    energise_transformer_ids: list[str] = Field(
+        default_factory=list,
+        description="Transformers switched in SIMULTANEOUSLY in this state (one ATS step, one "
+                    "black-start step). The energisation gate checks their summed inrush "
+                    "against the grid-forming current headroom of the section they land in.")
 
 
 class Site(BaseModel):

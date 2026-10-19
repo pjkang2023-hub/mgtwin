@@ -19,6 +19,7 @@ from enum import Enum
 
 from .ontology import (
     Converter,
+    ConverterControl,
     GroundingKind,
     Site,
     SynchronousGen,
@@ -708,7 +709,94 @@ def gate_forming(site: Site) -> GateReport:
     return rep
 
 
-ALL_GATES = (gate_forming, gate_units, gate_grounding, gate_protection, gate_model_honesty)
+
+def gate_energisation(site: Site) -> GateReport:
+    """
+    Energisation gate: can the grid-forming sources of a section absorb the
+    magnetising inrush of the transformers switched in together?
+
+    Converter-formed islands have no stiff source: the inrush of a transformer
+    is served by the current-limited PCS (and any machine) in the section, less
+    the current already carrying the section's load. A step whose summed peak
+    inrush exceeds that headroom drives the forming units into current limit,
+    collapses section voltage and risks a cascade trip of grid-following units.
+    The multiple `inrush_pu` is ASSUMED unless `inrush_identified` is set; the
+    verdict says so. Static check only: remanence, point-on-wave and
+    sympathetic inrush need an EMT study, which this gate names when it warns.
+    """
+    rep = GateReport()
+    sw_by_id = {sw.id: sw for sw in site.switches}
+    tx_by_id = {t.id: t for t in site.transformers}
+    v_kv = site.base.v_base_kv
+    for isl in site.islands:
+        if not isl.energise_transformer_ids:
+            continue
+        open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in isl.open_switches}
+        parent = {b.id: b.id for b in site.buses}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            if frozenset((a, b)) in open_pairs:
+                return
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for br in site.branches:
+            union(br.from_bus, br.to_bus)
+        for tx in site.transformers:
+            if tx.id not in isl.energise_transformer_ids:
+                union(tx.hv_bus, tx.lv_bus)
+        for sw in site.switches:
+            if sw.id not in isl.open_switches:
+                union(sw.from_bus, sw.to_bus)
+        energized = set(isl.energized_source_ids)
+        txs = [tx_by_id[t] for t in isl.energise_transformer_ids if t in tx_by_id]
+        roots = {find(tx.hv_bus) for tx in txs}
+        for r in roots:
+            buses = {b.id for b in site.buses if find(b.id) == r}
+            step = [tx for tx in txs if find(tx.hv_bus) == r]
+            gfm_mva = sum(c.s_rated_mva * c.params.i_limit_transient_pu for c in site.converters
+                          if c.id in energized and c.bus in buses and c.control != ConverterControl.GFL)
+            mach_mva = sum(m.s_rated_mva / max(m.xd_subtransient_pu, 0.05) for m in site.machines
+                           if m.id in energized and m.bus in buses)
+            load_mva = sum((ld.p_mw ** 2 + ld.q_mvar ** 2) ** 0.5 for ld in site.loads if ld.bus in buses)
+            gfl_mva = sum(c.s_rated_mva for c in site.converters
+                          if c.id in energized and c.bus in buses and c.control == ConverterControl.GFL)
+            # the forming units already carry whatever the grid-following fleet does not;
+            # only the remainder of their current limit is available for inrush
+            deficit_mva = max(load_mva - gfl_mva, 0.0)
+            to_a = 1e6 / (3 ** 0.5 * v_kv * 1e3)
+            head_pk = max(gfm_mva + mach_mva - deficit_mva, 0.0) * to_a * 2 ** 0.5
+            inrush_pk = sum(tx.inrush_pu * tx.s_rated_mva for tx in step) * to_a
+            assumed = any(not tx.inrush_identified for tx in step)
+            label = f"{isl.id}/energise({_zone_name(site, buses)})"
+            prov = "ASSUMED inrush multiple" if assumed else "IDENTIFIED inrush"
+            names = ", ".join(tx.id for tx in step)
+            ratio = inrush_pk / head_pk if head_pk > 0 else float("inf")
+            msg = (f"{len(step)} transformer(s) [{names}] switched together: summed peak inrush "
+                   f"{inrush_pk:.0f} A pk against forming headroom {head_pk:.0f} A pk "
+                   f"(ratio {ratio:.2f}; {prov})")
+            if ratio > 1.0:
+                rep.findings.append(Finding("energisation", Severity.FAIL, msg, label,
+                    "Sequence the closings (one transformer per step), use point-on-wave "
+                    "closing with remanence tracking, pre-magnetise from the LV side, or add "
+                    "forming capacity. Confirm with an EMT study."))
+            elif ratio > 0.8 or assumed:
+                rep.findings.append(Finding("energisation", Severity.WARN, msg, label,
+                    "Within headroom on the assumed multiple; identify the inrush multiple "
+                    "and check remanence / point-on-wave in an EMT study."))
+            else:
+                rep.findings.append(Finding("energisation", Severity.PASS, msg, label))
+    return rep
+
+
+ALL_GATES = (gate_forming, gate_units, gate_grounding, gate_protection, gate_model_honesty, gate_energisation)
 
 
 def run_all(site: Site) -> GateReport:

@@ -43,6 +43,7 @@ from .gates import (
     gate_model_honesty,
     gate_protection,
     gate_units,
+    gate_energisation,
     run_all,
 )
 from .identify import (
@@ -59,7 +60,7 @@ from .fault import SLGResult, slg_fault, zigzag_z0_pu
 from .runner import run_suite
 from .testrun import CaseStatus, CaseVerdict, ParamProvenance, RunReport
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 __all__ = [
     "Base",
@@ -85,6 +86,7 @@ __all__ = [
     "GateReport",
     "Severity",
     "gate_units",
+    "gate_energisation",
     "gate_grounding",
     "gate_protection",
     "gate_model_honesty",

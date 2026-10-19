@@ -988,3 +988,14 @@ def test_forming_gate_fails_section_of_grid_following_only():
     split = [f.severity for f in rep.findings if f.scope.startswith("SPLIT")]
     assert coupled == [Severity.PASS]
     assert sorted(v.value for v in split) == ["fail", "pass"]
+
+
+def test_energisation_gate_fails_whole_section_and_passes_one_at_a_time():
+    """Five 3 MVA transformers closed together exceed six 5.5 MVA PCS headroom; one at a time fits."""
+    import json
+    from mgtwin.gates import gate_energisation, Severity
+    site = Site.model_validate_json(open(__file__.replace("tests/test_mgtwin.py", "examples/c003_revC_site.json")).read())
+    rep = gate_energisation(site)
+    by = {str(f.scope).split("/")[0]: f.severity for f in rep.findings}
+    assert by["FAST_TRANSFER_WHOLE_SECTION"] == Severity.FAIL
+    assert by["SLOW_TRANSFER_ONE_GROUP"] in (Severity.PASS, Severity.WARN)
