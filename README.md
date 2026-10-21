@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.0 -- rungs 1-4 complete. Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.5 -- rungs 1-4 complete; seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -30,7 +30,7 @@ Run the demonstration:
 ```bash
 pip install pydantic numpy scipy pyyaml
 python examples/demo.py
-python -m pytest tests/ -q      # 29 tests
+python -m pytest tests/ -q      # 60 tests; 7 skip without the Banshee data packs
 ```
 
 ## Three design decisions worth arguing about
@@ -83,7 +83,7 @@ is still enough information to separate them. The honest verdict is therefore
 `IDENTIFIED` with the trade-off named — not a refusal. A gate that cried wolf
 here would be ignored when it mattered.
 
-## The loading gate (v0.6.4)
+## The loading gate and switch states (v0.6.4-v0.6.5)
 
 The grounding, forming and energisation gates check that a section has a
 zero-sequence path, a voltage reference and room for its inrush -- not that its
@@ -98,9 +98,18 @@ rating on a side with no source of its own. It reasons on ratings, not a load
 flow, so a PASS is necessary, not sufficient. `gate_units` now also checks a
 transformer's reactance on its own rating (0.02-0.25 pu): a value given on the
 site's base -- x 1.0 for 6 % on 3 MVA at a 50 MVA base -- is caught.
-The loading gate treats a switch marked `normally_closed: false` as open in every
-state (a state lists only the switches it opens); the older gates still read
-such a switch as closed unless the state opens it.
+
+Every gate reads a state's switches the same way (`Site.open_switch_ids`): a
+switch is open if the state lists it in `open_switches`, or if it is marked
+`normally_closed: false` and the state does not list it in `closed_switches`.
+A tie or alternate leg is therefore open unless the state closes it -- a
+transfer that re-closes groups onto their second leg says so. Before v0.6.5
+the gates read a normally open switch as closed in every state, which joined
+Rev C's boards through their ties and second legs: its BLACKSTART_GEN put the
+genset on the whole 30 MW site instead of the 15 MW it actually reaches. A
+state cannot both open and close one switch. The energisation gate FAILs a
+step whose transformer no energised source reaches ("the step energises
+nothing"), so a state that forgets to close a leg is caught rather than passed.
 
 ## What is deliberately absent
 

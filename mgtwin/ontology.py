@@ -322,6 +322,10 @@ class IslandConfig(BaseModel):
     id: str
     description: str = ""
     open_switches: list[str] = Field(default_factory=list)
+    closed_switches: list[str] = Field(
+        default_factory=list,
+        description="Normally open switches this state closes (a tie, an alternate leg after a "
+                    "transfer). A normally open switch not listed here is open.")
     grid_connected: bool
     energized_source_ids: list[str] = Field(default_factory=list)
     energise_transformer_ids: list[str] = Field(
@@ -357,6 +361,11 @@ class Site(BaseModel):
 
     def source_ids(self) -> set[str]:
         return {c.id for c in self.converters} | {m.id for m in self.machines}
+
+    def open_switch_ids(self, isl: "IslandConfig") -> set[str]:
+        """The switches open in a state: those it opens, and the normally open ones it does not close."""
+        closes = set(isl.closed_switches)
+        return set(isl.open_switches) | {sw.id for sw in self.switches if not sw.normally_closed and sw.id not in closes}
 
     def source(self, sid: str) -> Converter | SynchronousGen:
         for c in self.converters:
@@ -410,9 +419,12 @@ class Site(BaseModel):
             for sid in isl.energized_source_ids:
                 if sid not in srcs:
                     problems.append(f"island {isl.id!r} references unknown source {sid!r}")
-            for swid in isl.open_switches:
+            for swid in list(isl.open_switches) + list(isl.closed_switches):
                 if swid not in switch_ids:
                     problems.append(f"island {isl.id!r} references unknown switch {swid!r}")
+            both = set(isl.open_switches) & set(isl.closed_switches)
+            if both:
+                problems.append(f"island {isl.id!r} both opens and closes {sorted(both)}")
 
         if problems:
             raise ValueError("; ".join(problems))

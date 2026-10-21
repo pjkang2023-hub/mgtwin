@@ -235,7 +235,8 @@ def _zero_sequence_zones(site: Site, isl) -> tuple[list[set[str]], dict]:
     """
     open_pairs: set[frozenset[str]] = set()
     sw_by_id = {sw.id: sw for sw in site.switches}
-    for swid in isl.open_switches:
+    opened = site.open_switch_ids(isl)
+    for swid in opened:
         sw = sw_by_id[swid]
         open_pairs.add(frozenset((sw.from_bus, sw.to_bus)))
 
@@ -284,7 +285,7 @@ def _zero_sequence_zones(site: Site, isl) -> tuple[list[set[str]], dict]:
         if not severed(tx.hv_bus, tx.lv_bus):
             eunion(tx.hv_bus, tx.lv_bus)
     for sw in site.switches:
-        if sw.id not in isl.open_switches and not severed(sw.from_bus, sw.to_bus):
+        if sw.id not in opened and not severed(sw.from_bus, sw.to_bus):
             eunion(sw.from_bus, sw.to_bus)
 
     src_buses = {site.source(sid).bus for sid in isl.energized_source_ids}
@@ -297,7 +298,7 @@ def _zero_sequence_zones(site: Site, isl) -> tuple[list[set[str]], dict]:
         if not severed(br.from_bus, br.to_bus):
             union(br.from_bus, br.to_bus)
     for sw in site.switches:
-        if sw.id not in isl.open_switches and not severed(sw.from_bus, sw.to_bus):
+        if sw.id not in opened and not severed(sw.from_bus, sw.to_bus):
             union(sw.from_bus, sw.to_bus)
 
     zones: dict[str, set[str]] = {}
@@ -534,7 +535,7 @@ def gate_protection(site: Site) -> GateReport:
             )
             continue
 
-        open_sw = set(isl.open_switches)
+        open_sw = site.open_switch_ids(isl)
         in_service = [r for r in site.relays if r.switch_id not in open_sw]
 
         for r in in_service:
@@ -678,7 +679,8 @@ def gate_forming(site: Site) -> GateReport:
     for isl in site.islands:
         if isl.grid_connected or not isl.energized_source_ids:
             continue
-        open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in isl.open_switches}
+        opened = site.open_switch_ids(isl)
+        open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in opened}
         parent = {b.id: b.id for b in site.buses}
 
         def find(x):
@@ -699,7 +701,7 @@ def gate_forming(site: Site) -> GateReport:
         for tx in site.transformers:
             union(tx.hv_bus, tx.lv_bus)
         for sw in site.switches:
-            if sw.id not in isl.open_switches:
+            if sw.id not in opened:
                 union(sw.from_bus, sw.to_bus)
         energized = set(isl.energized_source_ids)
         src_bus = {s_.id: s_.bus for s_ in list(site.machines) + list(site.converters)}
@@ -750,7 +752,8 @@ def gate_energisation(site: Site) -> GateReport:
     for isl in site.islands:
         if not isl.energise_transformer_ids:
             continue
-        open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in isl.open_switches}
+        opened = site.open_switch_ids(isl)
+        open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in opened}
         parent = {b.id: b.id for b in site.buses}
 
         def find(x):
@@ -772,7 +775,7 @@ def gate_energisation(site: Site) -> GateReport:
             if tx.id not in isl.energise_transformer_ids:
                 union(tx.hv_bus, tx.lv_bus)
         for sw in site.switches:
-            if sw.id not in isl.open_switches:
+            if sw.id not in opened:
                 union(sw.from_bus, sw.to_bus)
         energized = set(isl.energized_source_ids)
         txs = [tx_by_id[t] for t in isl.energise_transformer_ids if t in tx_by_id]
@@ -780,6 +783,13 @@ def gate_energisation(site: Site) -> GateReport:
         for r in roots:
             buses = {b.id for b in site.buses if find(b.id) == r}
             step = [tx for tx in txs if find(tx.hv_bus) == r]
+            if not any(s_.bus in buses for s_ in list(site.machines) + list(site.converters) if s_.id in energized):
+                rep.findings.append(Finding("energisation", Severity.FAIL,
+                    f"{', '.join(tx.id for tx in step)}: no energised source reaches the HV side in this "
+                    f"state - the step energises nothing", f"{isl.id}/energise({_zone_name(site, buses)})",
+                    "Close the switch that connects it (a normally open leg goes in the state's "
+                    "closed_switches), or correct the state's open switches."))
+                continue
             gfm_mva = sum(c.s_rated_mva * c.params.i_limit_transient_pu for c in site.converters
                           if c.id in energized and c.bus in buses and c.control != ConverterControl.GFL)
             mach_mva = sum(m.s_rated_mva / max(m.xd_subtransient_pu, 0.05) for m in site.machines
@@ -816,13 +826,9 @@ def gate_energisation(site: Site) -> GateReport:
 
 
 def _sections(site: Site, isl, without: frozenset = frozenset()):
-    """
-    Union-find over an island's closed switches, branches and transformers (less `without`).
-    A switch is closed when it is normally closed and the state does not open it. A normally
-    open tie or alternate leg stays open: a state can only list switches it opens.
-    """
+    """Union-find over an island's closed switches, branches and transformers (less `without`)."""
     sw_by_id = {sw.id: sw for sw in site.switches}
-    opened = set(isl.open_switches) | {sw.id for sw in site.switches if not sw.normally_closed}
+    opened = site.open_switch_ids(isl)
     open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in opened if i in sw_by_id}
     parent = {b.id: b.id for b in site.buses}
 
@@ -862,8 +868,7 @@ def gate_loading(site: Site) -> GateReport:
     sources' (machines and converters without storage) - the section then runs on its
     batteries; and FAIL for a transformer feeding a side with no source of its own whose load
     exceeds its rating. Ratings, not a load flow: losses, voltage and temperature derating are not
-    counted, so a PASS is necessary, not sufficient. Unlike the other gates, it honours
-    `normally_closed`: a normally open tie or alternate leg is open in every state.
+    counted, so a PASS is necessary, not sufficient.
     """
     rep = GateReport()
     tx_by_id = {t.id: t for t in site.transformers}

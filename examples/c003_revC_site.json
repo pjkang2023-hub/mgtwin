@@ -2254,6 +2254,13 @@
     "TR_SOFC03",
     "TR_SOFC04",
     "TR_SOFC05"
+   ],
+   "closed_switches": [
+    "CB_SOFC01_2",
+    "CB_SOFC02_2",
+    "CB_SOFC03_2",
+    "CB_SOFC04_2",
+    "CB_SOFC05_2"
    ]
   },
   {
@@ -2294,6 +2301,9 @@
    ],
    "energise_transformer_ids": [
     "TR_SOFC01"
+   ],
+   "closed_switches": [
+    "CB_SOFC01_2"
    ]
   },
   {

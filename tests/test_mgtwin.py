@@ -1061,8 +1061,8 @@ def test_units_gate_fails_transformer_reactance_on_the_system_base():
 
 
 def test_loading_gate_keeps_normally_open_switches_open():
-    """A normally open tie or alternate leg is open in every state (a state lists only the switches it opens), so
-    it does not join the boards it ties; marked normally closed, it does."""
+    """A normally open tie or alternate leg is open unless the state closes it, so it does not join the boards it
+    ties; marked normally closed, it does."""
     from mgtwin.gates import _sections
     site = _revc_example()
     apart = [(isl, sw) for isl in site.islands for sw in site.switches if not sw.normally_closed
@@ -1072,3 +1072,32 @@ def test_loading_gate_keeps_normally_open_switches_open():
     sw.normally_closed = True
     find = _sections(site, isl)
     assert find(sw.from_bus) == find(sw.to_bus)
+
+
+def test_a_state_closes_a_normally_open_leg():
+    """Rev C's transfers re-close groups 1-5 onto SOFC-2A through their normally open second legs: listed in the
+    state's closed_switches, the legs conduct and the energisation gate weighs the step's inrush. Left out, the
+    gate says the step energises nothing - it never passes a dead transformer."""
+    from mgtwin.gates import gate_energisation, Severity
+    site = _revc_example()
+    isl = next(i for i in site.islands if i.id == "FAST_TRANSFER_WHOLE_SECTION")
+    assert "CB_SOFC01_2" in isl.closed_switches and "CB_SOFC01_2" not in site.open_switch_ids(isl)
+    fast = [f for f in gate_energisation(site).findings if str(f.scope).startswith("FAST_TRANSFER_WHOLE_SECTION/")]
+    assert len(fast) == 1 and "5 transformer(s)" in fast[0].message and fast[0].severity == Severity.FAIL
+    isl.closed_switches = []
+    fast = [f for f in gate_energisation(site).findings if str(f.scope).startswith("FAST_TRANSFER_WHOLE_SECTION/")]
+    assert len(fast) == 5 and all("no energised source reaches" in f.message for f in fast)
+
+
+def test_a_state_cannot_open_and_close_one_switch():
+    import pytest
+    from mgtwin.ontology import Site
+    raw = _revc_example().model_dump(mode="json")
+    st = next(i for i in raw["islands"] if i["id"] == "FAST_TRANSFER_WHOLE_SECTION")
+    st["open_switches"].append("CB_SOFC01_2")
+    with pytest.raises(ValueError, match="both opens and closes"):
+        Site.model_validate(raw)
+    st["open_switches"].remove("CB_SOFC01_2")
+    st["closed_switches"].append("CB_NOPE")
+    with pytest.raises(ValueError, match="unknown switch"):
+        Site.model_validate(raw)
