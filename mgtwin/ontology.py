@@ -137,20 +137,116 @@ class Switch(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: ANSI device functions a relay may declare, and what each is.
+ANSI_FUNCTIONS = {
+    "50": "phase instantaneous overcurrent",
+    "51": "phase time overcurrent",
+    "50N": "residual instantaneous overcurrent",
+    "51N": "residual time overcurrent",
+    "50G": "ground instantaneous overcurrent",
+    "51G": "ground time overcurrent",
+    "67": "directional phase overcurrent",
+    "67N": "directional earth-fault overcurrent",
+    "51V": "voltage-restrained / -controlled overcurrent",
+    "21": "distance",
+    "87L": "line differential",
+    "87B": "bus differential",
+    "87T": "transformer differential",
+    "27": "undervoltage",
+    "59": "overvoltage",
+    "59N": "neutral overvoltage",
+    "81U": "underfrequency",
+    "81O": "overfrequency",
+    "50BF": "breaker failure",
+}
+#: Phase elements whose operation rests on fault-current magnitude.
+PHASE_OC = {"50", "51", "67"}
+#: Earth-fault elements: their magnitude is the zero-sequence path's, which the gates do not compute.
+EARTH_OC = {"50N", "51N", "50G", "51G", "67N"}
+#: The note on the element a relay's legacy fields declare.
+LEGACY_ELEMENT = "from the relay's pickup_a / curve / time_dial / directional"
+#: Elements whose discrimination does not rest on current magnitude alone.
+UNIT = {"87L", "87B", "87T"}
+NOT_MAGNITUDE = UNIT | {"51V", "21"}
+
+
+class ProtectionFunction(BaseModel):
+    """
+    One protection element on a breaker's relay. Pickup is primary amperes, as it is set in the
+    field; None for elements set otherwise (a differential's bias, a voltage or frequency element).
+    `groups` names the settings groups the element is active in - empty means every group - and a
+    state selects one (IslandConfig.settings_group). A unit element's zone is the buses it covers.
+    """
+
+    ansi: str
+    pickup_a: float | None = Field(None, gt=0.0, description="Primary amperes")
+    direction: Literal["none", "forward", "reverse"] = "none"
+    curve: str = ""
+    time_dial: float | None = Field(None, gt=0.0)
+    groups: list[str] = Field(default_factory=list)
+    zone_buses: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "ProtectionFunction":
+        if self.ansi not in ANSI_FUNCTIONS:
+            raise ValueError(f"unknown ANSI function {self.ansi!r} (one of {sorted(ANSI_FUNCTIONS)})")
+        if self.ansi.startswith("67") and self.direction == "none":
+            raise ValueError(f"a {self.ansi} element needs a direction")
+        if self.ansi in UNIT and not self.zone_buses:
+            raise ValueError(f"a {self.ansi} element needs its zone's buses")
+        return self
+
+    @property
+    def directional(self) -> bool:
+        return self.direction != "none" or self.ansi in UNIT
+
+    def active_in(self, group: str) -> bool:
+        return not self.groups or group in self.groups
+
+
 class OvercurrentRelay(BaseModel):
     """
-    Phase overcurrent element. Pickup is stored in amperes, deliberately, because
-    that is how it is set in the field and converting it is where errors enter.
+    The relay on one breaker. Its protection elements are `functions`; the legacy fields
+    (pickup_a, curve, time_dial, directional) declare one phase overcurrent element active in
+    every settings group - a 67 forward when `directional`, else a 51 - so a Site written before
+    v0.6.8 reads as it did. Pickup is stored in amperes, deliberately, because that is how it is
+    set in the field and converting it is where errors enter.
     """
 
     id: str
     switch_id: str
     ct_ratio: float = Field(gt=0.0, description="e.g. 600.0 for 600:5")
-    pickup_a: float = Field(gt=0.0, description="Primary amperes")
+    pickup_a: float | None = Field(None, gt=0.0, description="Primary amperes")
     curve: str = "IEC-VI"
-    time_dial: float = Field(gt=0.0)
+    time_dial: float | None = Field(None, gt=0.0)
     directional: bool = False
+    functions: list[ProtectionFunction] = Field(default_factory=list)
     notes: str = ""
+
+    @model_validator(mode="after")
+    def _has_an_element(self) -> "OvercurrentRelay":
+        if self.pickup_a is None and not self.functions:
+            raise ValueError(f"relay {self.id!r} declares no protection element (pickup_a or functions)")
+        return self
+
+    def legacy_element(self) -> ProtectionFunction | None:
+        if self.pickup_a is None:
+            return None
+        return ProtectionFunction(ansi="67" if self.directional else "51", pickup_a=self.pickup_a,
+                                  direction="forward" if self.directional else "none",
+                                  curve=self.curve, time_dial=self.time_dial, notes=LEGACY_ELEMENT)
+
+    def elements(self) -> list[ProtectionFunction]:
+        leg = self.legacy_element()
+        return ([leg] if leg else []) + list(self.functions)
+
+    def active(self, group: str) -> list[ProtectionFunction]:
+        return [e for e in self.elements() if e.active_in(group)]
+
+
+#: The relay on a breaker, with the protection functions it carries.
+Relay = OvercurrentRelay
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +423,9 @@ class IslandConfig(BaseModel):
         description="Normally open switches this state closes (a tie, an alternate leg after a "
                     "transfer). A normally open switch not listed here is open.")
     grid_connected: bool
+    settings_group: str = Field(
+        "A", description="The protection settings group the relays run in this state (black start, "
+                         "islanded and grid-connected states typically differ).")
     energized_source_ids: list[str] = Field(default_factory=list)
     energise_transformer_ids: list[str] = Field(
         default_factory=list,
@@ -413,6 +512,9 @@ class Site(BaseModel):
         for r in self.relays:
             if r.switch_id not in switch_ids:
                 problems.append(f"relay {r.id!r} references unknown switch {r.switch_id!r}")
+            for fn in r.functions:
+                for b in fn.zone_buses:
+                    need(b, f"relay {r.id!r} {fn.ansi} zone")
 
         srcs = self.source_ids()
         for isl in self.islands:

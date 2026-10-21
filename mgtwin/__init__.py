@@ -29,6 +29,8 @@ from .ontology import (
     Load,
     LoadModel,
     OvercurrentRelay,
+    ProtectionFunction,
+    Relay,
     Site,
     Switch,
     SynchronousGen,
@@ -49,7 +51,8 @@ from .gates import (
     run_all,
 )
 from .ingest import IngestReport, Tag, TagRule, TagStatus, compare_with_site, ingest_tags, load_rules, read_tags
-from .envelope import Envelope, IdentificationRecord, Inside, Phenomenon, Support, build_envelope
+from .envelope import (Envelope, IdentificationRecord, Inside, Phenomenon, ProtectionStudyRecord, Support,
+                       build_envelope, load_protection_studies)
 from .identify import (
     IdentificationResult,
     MultiIdentificationResult,
@@ -64,7 +67,7 @@ from .fault import SLGResult, slg_fault, zigzag_z0_pu
 from .runner import run_suite
 from .testrun import CaseStatus, CaseVerdict, ParamProvenance, RunReport
 
-__version__ = "0.6.7"
+__version__ = "0.6.8"
 
 __all__ = [
     "IngestReport",
@@ -97,6 +100,10 @@ __all__ = [
     "Load",
     "LoadModel",
     "OvercurrentRelay",
+    "ProtectionFunction",
+    "Relay",
+    "ProtectionStudyRecord",
+    "load_protection_studies",
     "Site",
     "Switch",
     "SynchronousGen",

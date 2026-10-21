@@ -1250,3 +1250,106 @@ def test_banshee_transformers_paired_by_impedance_on_their_own_rating():
     tx = {t.id: t for t in site.transformers}
     assert tx["XTX_3_4"].s_rated_mva == 0.5 and abs(tx["XTX_3_4"].x_pu - 0.049) < 1e-3
     assert not [f for f in gate_units(site).findings if f.severity == Severity.FAIL and "reactance" in f.message]
+
+
+# ---------------------------------------------------------------------------
+# v0.6.8: protection functions, settings groups, and the screening checks
+# ---------------------------------------------------------------------------
+
+
+def _two_bess_site(functions=None, pickup_a=None, groups=("A",), state_group="A"):
+    """Two 5 MVA grid-forming BESS on B1 and B2, tied by breaker SW; its relay carries `functions`."""
+    from mgtwin.ontology import ProtectionFunction  # noqa: F401
+    bess = lambda i, b: Converter(id=i, bus=b, s_rated_mva=5.0, control=ConverterControl.GFM_DROOP,  # noqa: E731
+                                  params=ConverterParams(p_f_droop_pu=0.05, i_limit_transient_pu=1.2))
+    return _minimal_site(
+        buses=[Bus(id="B1", v_nom_kv=11.0), Bus(id="B2", v_nom_kv=11.0)],
+        converters=[bess("BESS1", "B1"), bess("BESS2", "B2")],
+        switches=[Switch(id="SW", from_bus="B1", to_bus="B2")],
+        relays=[OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=pickup_a,
+                                 functions=list(functions or []))],
+        islands=[IslandConfig(id="I1", grid_connected=False, settings_group=state_group,
+                              energized_source_ids=["BESS1", "BESS2"])],
+    )
+
+
+def test_protection_functions_are_validated():
+    from mgtwin.ontology import ProtectionFunction
+    with pytest.raises(ValueError, match="unknown ANSI"):
+        ProtectionFunction(ansi="99X")
+    with pytest.raises(ValueError, match="needs a direction"):
+        ProtectionFunction(ansi="67N", pickup_a=50.0)
+    with pytest.raises(ValueError, match="zone's buses"):
+        ProtectionFunction(ansi="87L")
+    with pytest.raises(ValueError, match="declares no protection element"):
+        OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0)
+    with pytest.raises(ValueError, match="unknown bus"):
+        _two_bess_site([ProtectionFunction(ansi="87L", zone_buses=["B1", "NOPE"])])
+
+
+def test_a_legacy_relay_reads_as_one_phase_element():
+    r = OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=300.0, time_dial=0.3)
+    (e,) = r.elements()
+    assert e.ansi == "51" and e.pickup_a == 300.0 and e.active_in("BLACKSTART")
+    assert OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=300.0, directional=True
+                            ).elements()[0].ansi == "67"
+
+
+def test_protection_gate_fails_a_state_whose_settings_group_has_nothing_active():
+    """The black-start state runs group BS; a relay set only for the grid-connected group G leaves the breaker
+    unprotected there. Give it a low-set 51 in BS and the state is screened again."""
+    from mgtwin.ontology import ProtectionFunction
+    grid_only = [ProtectionFunction(ansi="51", pickup_a=1200.0, groups=["G"])]
+    rep = gate_protection(_two_bess_site(grid_only, state_group="BS"))
+    assert any("no element of relay R is active in settings group 'BS'" in f.message for f in rep.by_severity(Severity.FAIL))
+    both = grid_only + [ProtectionFunction(ansi="51", pickup_a=200.0, groups=["BS"])]
+    rep = gate_protection(_two_bess_site(both, state_group="BS"))
+    assert not rep.failed
+    assert [f.scope for f in rep.findings if "pickup available" in f.message] == ["I1/R/51"]
+
+
+def test_protection_gate_names_magnitude_only_breakers_and_passes_unit_protection():
+    from mgtwin.ontology import ProtectionFunction
+    rep = gate_protection(_two_bess_site(pickup_a=150.0))
+    warn = [f for f in rep.by_severity(Severity.WARN) if "current-limited converters" in f.message]
+    assert warn and "rests on magnitude at R" in warn[0].message
+    rep = gate_protection(_two_bess_site([ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"])], pickup_a=150.0))
+    assert not [f for f in rep.by_severity(Severity.WARN) if "current-limited converters" in f.message]
+    assert any("does not rest on magnitude alone" in f.message for f in rep.by_severity(Severity.PASS))
+
+
+def test_protection_gate_wants_direction_on_a_breaker_fed_from_both_sides():
+    """BESS on each side of SW: a non-directional 51 sees through-faults; a 67 or an 87L does not need the WARN."""
+    from mgtwin.ontology import ProtectionFunction
+    both_sides = lambda rep: [f for f in rep.by_severity(Severity.WARN) if "from both sides" in f.message]  # noqa: E731
+    assert both_sides(gate_protection(_two_bess_site(pickup_a=150.0)))
+    assert not both_sides(gate_protection(_two_bess_site(
+        [ProtectionFunction(ansi="67", pickup_a=150.0, direction="forward")])))
+    assert not both_sides(gate_protection(_two_bess_site(
+        [ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"])], pickup_a=150.0)))
+
+
+def test_envelope_takes_protection_studies(tmp_path):
+    """A study supersedes the screening for the state it covers: failed -> outside; passed on assumed converter
+    models -> provisional, naming the study; on identified models -> inside. States it does not cover keep the
+    screening's provisional verdict."""
+    import json as _json
+    from mgtwin.envelope import Inside, ProtectionStudyRecord, build_envelope, load_protection_studies
+    site = _revc_rebased()
+    path = tmp_path / "studies.json"
+    path.write_text(_json.dumps([
+        {"state_id": "NORMAL", "tool": "Electrisim", "passed": True, "reference": "C003 report Rev 6, s. 9"},
+        {"state_id": "N1_PCS", "tool": "Electrisim", "passed": True, "models_identified": True},
+        {"state_id": "MVA_BUS_FAULT", "tool": "Electrisim", "passed": False}]))
+    env = build_envelope(site, protection_studies=load_protection_studies(path))
+    v, why = env.check("NORMAL", "protection")
+    assert v == Inside.PROVISIONAL and why == ["studied in Electrisim (C003 report Rev 6, s. 9) on assumed converter "
+                                               "current limits and ride-through"]
+    assert env.check("N1_PCS", "protection") == (Inside.INSIDE, [])
+    v, why = env.check("MVA_BUS_FAULT", "protection")
+    assert v == Inside.OUTSIDE and "Electrisim protection study" in why[0]
+    v, why = env.check("N1_SOFC", "protection")
+    assert v == Inside.PROVISIONAL and any("ride-through assumed" in w for w in why)
+    assert "## Protection studies" in env.render() and env.to_dict()["protection_studies"]["N1_PCS"]["passed"]
+    with pytest.raises(ValueError, match="does not enumerate"):
+        build_envelope(site, protection_studies=[ProtectionStudyRecord("NOPE", "Electrisim", True)])

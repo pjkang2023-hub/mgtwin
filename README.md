@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.7 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.8 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -30,7 +30,7 @@ Run the demonstration:
 ```bash
 pip install pydantic numpy scipy pyyaml
 python examples/demo.py
-python -m pytest tests/ -q      # 67 tests; 8 skip without the Banshee data (set BANSHEE_DATA)
+python -m pytest tests/ -q      # 73 tests; 8 skip without the Banshee data (set BANSHEE_DATA)
 ```
 
 ## Three design decisions worth arguing about
@@ -110,6 +110,45 @@ genset on the whole 30 MW site instead of the 15 MW it actually reaches. A
 state cannot both open and close one switch. The energisation gate FAILs a
 step whose transformer no energised source reaches ("the step energises
 nothing"), so a state that forgets to close a leg is caught rather than passed.
+
+## Protection: what mgtwin declares and screens, what a study decides (v0.6.8)
+
+The split: the Site is the single record of the breakers and the relay
+settings installed on them; mgtwin screens those settings from ratings; a
+protection study - fault currents at each relay in each state, grading,
+coordination, settings, arc flash - is a network solver's job (Electrisim),
+and its verdict comes back into the envelope.
+
+**Declared.** A relay (`OvercurrentRelay`, alias `Relay`) carries a list of
+`ProtectionFunction`s: ANSI code (50/51, 50N/51N, 50G/51G, 67/67N, 51V, 21,
+87L/87B/87T, 27/59/59N, 81U/81O, 50BF), pickup in primary amperes, direction,
+curve and time dial, the settings groups it is active in (none listed: all),
+and for a unit element the buses of its zone. A 67 must have a direction and
+an 87 its zone. The legacy fields - one pickup, curve, time dial, directional
+flag - still declare one phase element (51, or 67 forward) active in every
+group, so earlier Sites read unchanged. Each state names its
+`settings_group` (default "A").
+
+**Screened** (`gate_protection`), per islanded state, on the elements active
+in its group: a closed breaker with no element active is unprotected (FAIL -
+the black-start group a relay was never given); every 50/51/67 pickup against
+the available converter-limited fault current with the 1.5x dependability
+margin (FAIL); in a converter-dominated state, the breakers whose primary
+protection rests on magnitude alone - no 87, 21 or 51V - are named (WARN), and
+a PASS when none does; a breaker that fault current reaches from both sides
+with only non-directional overcurrent sees through-faults (WARN: it needs 67
+or 87L). On Banshee's ISL_ALL that last check finds each feeder head fed back
+by the other feeders' DER. Earth-fault elements are not screened by
+magnitude: their current is the zero-sequence path's.
+
+**Decided by a study.** `build_envelope(..., protection_studies=[...])` takes
+a `ProtectionStudyRecord` per state studied (`load_protection_studies` reads
+them from JSON: state, tool, passed, whether the converter models were
+identified, reference). For those states the study supersedes the screening:
+a failed study puts protection OUTSIDE; a passed one on identified models
+INSIDE, on assumed ones PROVISIONAL naming the study; a passed study also
+lifts a protection-gate screening FAIL, since it computed the currents the
+screening only bounds. States no study covers keep the screening's verdict.
 
 ## Banshee transformer ratings (v0.6.7)
 

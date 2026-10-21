@@ -92,6 +92,29 @@ class IdentificationRecord:
 
 
 @dataclass
+class ProtectionStudyRecord:
+    """
+    A protection study's verdict on one state, from the tool that computes fault currents
+    (Electrisim: IEC 60909 and EMT fault levels at each relay, grading, settings). `passed` is
+    the study's own conclusion; `models_identified` says whether its converter current limits and
+    ride-through were identified from measured response or the vendors' assumed models.
+    """
+
+    state_id: str
+    tool: str
+    passed: bool
+    models_identified: bool = False
+    reference: str = ""
+    notes: str = ""
+
+
+def load_protection_studies(path) -> list[ProtectionStudyRecord]:
+    """Records from a JSON list of {state_id, tool, passed, models_identified?, reference?, notes?}."""
+    with open(path, encoding="utf-8") as f:
+        return [ProtectionStudyRecord(**r) for r in json.load(f)]
+
+
+@dataclass
 class StateEnvelope:
     state_id: str
     grid_connected: bool
@@ -112,6 +135,7 @@ class Envelope:
     assumed_sources: list[str]          # grid-forming sources with no identification record
     ride_through_assumed: list[str]
     undeclared: list[str]
+    protection_studies: dict[str, ProtectionStudyRecord] = field(default_factory=dict)
 
     # -- the question ----------------------------------------------------------
     def check(self, state_id: str, phenomenon: Phenomenon | str, load_mva: float | None = None,
@@ -128,8 +152,13 @@ class Envelope:
         if st is None:
             out.append(f"state {state_id!r} is not enumerated in the Site: the twin says nothing about it")
         else:
-            if ph.value in st.excluded:
-                out.append(f"the gates FAIL this state for {ph.value}: {'; '.join(st.excluded[ph.value][:3])}")
+            excl = st.excluded.get(ph.value, [])
+            passed_study = self.protection_studies.get(state_id)
+            if ph == Phenomenon.PROTECTION and passed_study is not None and passed_study.passed:
+                # the study computed the fault currents the screening only bounds from ratings
+                excl = [x for x in excl if not x.startswith("protection:")]
+            if excl:
+                out.append(f"the gates FAIL this state for {ph.value}: {'; '.join(excl[:3])}")
             if load_mva is not None and not st.grid_connected:
                 if load_mva > st.rating_mva + 1e-9:
                     out.append(f"load {load_mva:g} MVA exceeds the state's source rating {st.rating_mva:g} MVA")
@@ -147,11 +176,24 @@ class Envelope:
                             rec.step_range_pu[0] - 1e-9 <= abs(step_pu) <= rec.step_range_pu[1] + 1e-9):
                         prov.append(f"{sid}: step {step_pu:g} pu outside the identified "
                                     f"{rec.step_range_pu[0]:g}-{rec.step_range_pu[1]:g} pu - an extrapolation")
-            if ph == Phenomenon.PROTECTION:
+            study = self.protection_studies.get(state_id) if ph == Phenomenon.PROTECTION else None
+            if study is not None:
+                # A study supersedes the screening: its verdict, its models' provenance.
+                prov = [w for w in prov if "dynamic parameters" not in w and "identification verdict" not in w
+                        and "extrapolation" not in w]
+                if not study.passed:
+                    out.append(f"the {study.tool} protection study finds this state's protection fails"
+                               + (f" ({study.reference})" if study.reference else ""))
+                elif not study.models_identified:
+                    prov.append(f"studied in {study.tool}"
+                                + (f" ({study.reference})" if study.reference else "")
+                                + " on assumed converter current limits and ride-through")
+            elif ph == Phenomenon.PROTECTION:
                 assumed = [s for s in st.sources if s in self.ride_through_assumed]
                 if assumed:
                     prov.append(f"current-limit / ride-through assumed for {', '.join(assumed)}")
-        if support == Support.PROVISIONAL and not out:
+        studied = ph == Phenomenon.PROTECTION and state_id in self.protection_studies
+        if support == Support.PROVISIONAL and not out and not studied:
             prov.append(why)
         if out:
             return Inside.OUTSIDE, out
@@ -174,6 +216,8 @@ class Envelope:
             "assumed_sources": self.assumed_sources,
             "ride_through_assumed": self.ride_through_assumed,
             "undeclared": self.undeclared,
+            "protection_studies": {k: {"tool": r.tool, "passed": r.passed, "models_identified": r.models_identified,
+                                       "reference": r.reference} for k, r in self.protection_studies.items()},
         }
 
     def to_json(self, path=None) -> str:
@@ -204,6 +248,11 @@ class Envelope:
             L.append(f"- assumed (no identification): {', '.join(self.assumed_sources)}")
         if self.ride_through_assumed:
             L.append(f"- current limit / ride-through assumed: {', '.join(self.ride_through_assumed)}")
+        if self.protection_studies:
+            L += ["", "## Protection studies", "", "| State | Tool | Verdict | Models | Reference |", "|---|---|---|---|---|"]
+            L += [f"| {r.state_id} | {r.tool} | {'passed' if r.passed else 'FAILS'} | "
+                  f"{'identified' if r.models_identified else 'assumed'} | {r.reference} |"
+                  for r in self.protection_studies.values()]
         if self.undeclared:
             L += ["", "## Undeclared bounds (not invented)", ""]
             L += [f"- {u}" for u in self.undeclared]
@@ -211,8 +260,14 @@ class Envelope:
 
 
 def build_envelope(site: Site, identifications: list[IdentificationRecord] | None = None,
-                   report: GateReport | None = None) -> Envelope:
-    """Declare the envelope of a Site from its gates and its identification records."""
+                   report: GateReport | None = None,
+                   protection_studies: list[ProtectionStudyRecord] | None = None) -> Envelope:
+    """
+    Declare the envelope of a Site from its gates, its identification records and the protection
+    studies run on its states. A studied state's protection is judged by the study: OUTSIDE if it
+    fails, INSIDE if it passed on identified models, PROVISIONAL if on assumed ones; a state no
+    study covers keeps the gates' screening, PROVISIONAL at best.
+    """
     from . import __version__
 
     report = report if report is not None else run_all(site)
@@ -221,6 +276,10 @@ def build_envelope(site: Site, identifications: list[IdentificationRecord] | Non
     if unknown:
         raise ValueError(f"identification records for unknown sources {unknown}")
     island_ids = {i.id for i in site.islands}
+    studies = {r.state_id: r for r in (protection_studies or [])}
+    unknown = sorted(set(studies) - island_ids)
+    if unknown:
+        raise ValueError(f"protection studies for states the Site does not enumerate: {unknown}")
 
     site_wide, per_state = [], {}
     for f in report.findings:
@@ -256,8 +315,13 @@ def build_envelope(site: Site, identifications: list[IdentificationRecord] | Non
         Phenomenon.LOADING: (Support.SUPPORTED, "ratings, not a load flow: a pass is necessary, not sufficient"),
         Phenomenon.FREQUENCY: ((Support.PROVISIONAL, "aggregate RMS model on assumed dynamic parameters")
                                if any_assumed else (Support.SUPPORTED, "aggregate RMS model on identified parameters")),
-        Phenomenon.PROTECTION: ((Support.PROVISIONAL, "screening on assumed current limits; settings need EMT")
-                                if rt_assumed else (Support.SUPPORTED, "screening; settings still need EMT")),
+        Phenomenon.PROTECTION: ((Support.PROVISIONAL, "screening on assumed current limits; settings need a "
+                                 "protection study")
+                                if rt_assumed else (Support.SUPPORTED, "screening; settings need a protection study"))
+                               if not studies else
+                               (Support.PROVISIONAL if rt_assumed else Support.SUPPORTED,
+                                f"protection studies for {len(studies)} of {len(site.islands)} states; "
+                                f"the rest screened only"),
         Phenomenon.GROUNDING: (Support.SUPPORTED, "zero-sequence topology; SLG overvoltage on radial feeders only"),
         Phenomenon.ENERGISATION: ((Support.PROVISIONAL, "static check on assumed inrush multiples")
                                   if inrush_assumed else (Support.SUPPORTED, "static check; waveforms need EMT")),
@@ -270,4 +334,5 @@ def build_envelope(site: Site, identifications: list[IdentificationRecord] | Non
     if any(isl.grid_connected for isl in site.islands):
         undeclared.append("grid strength at the point of interconnection (grid-connected states)")
 
-    return Envelope(site.id, __version__, phenomena, states, site_wide, ids, assumed, rt_assumed, undeclared)
+    return Envelope(site.id, __version__, phenomena, states, site_wide, ids, assumed, rt_assumed, undeclared,
+                    studies)

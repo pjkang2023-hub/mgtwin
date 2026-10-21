@@ -20,6 +20,10 @@ from enum import Enum
 from .ontology import (
     Converter,
     ConverterControl,
+    EARTH_OC,
+    LEGACY_ELEMENT,
+    NOT_MAGNITUDE,
+    PHASE_OC,
     GroundingKind,
     Site,
     SynchronousGen,
@@ -488,14 +492,28 @@ CONVERTER_DOMINANCE = 0.80
 
 def gate_protection(site: Site) -> GateReport:
     """
-    Screening check: will overcurrent protection operate when islanded?
+    Screening check: will the protection operate when islanded, in the settings
+    group each state runs?
 
     Grid-connected, the utility contributes 5-10 pu of fault current and
     overcurrent grading works. Islanded, the sources are current-limited
     converters contributing perhaps 1.1-1.5 pu of their own rating. Relay
     settings carried over from the grid-connected study may simply never pick up.
+    That is the finding that blocks energization, so it is FAIL, not WARN.
 
-    This is the finding that blocks energization, so it is FAIL, not WARN.
+    Per islanded state, for the elements active in its settings group:
+      * a closed breaker whose relay has no element active in the group is
+        unprotected in that state: FAIL;
+      * every phase overcurrent element with a pickup (50, 51, 67) against the
+        available fault current, with the dependability margin;
+      * converter-dominated states: the breakers whose primary protection rests
+        on magnitude alone (no 87, 21 or 51V element) are named in a WARN;
+      * a breaker that fault current reaches from both sides (energised sources
+        on each) with only non-directional overcurrent sees through-faults:
+        WARN, it needs direction (67) or unit protection.
+    Earth-fault elements are not screened: their current is the zero-sequence
+    path's. Screening only - grading, settings and fault levels are a
+    protection study's (Electrisim), whose results the envelope takes.
     """
     rep = GateReport()
 
@@ -537,18 +555,33 @@ def gate_protection(site: Site) -> GateReport:
 
         open_sw = site.open_switch_ids(isl)
         in_service = [r for r in site.relays if r.switch_id not in open_sw]
+        group = isl.settings_group
 
+        oc_elements = []
         for r in in_service:
-            ratio = total_a / r.pickup_a
+            act = r.active(group)
+            if not act:
+                rep.findings.append(Finding("protection", Severity.FAIL,
+                    f"no element of relay {r.id} is active in settings group {group!r}: breaker "
+                    f"{r.switch_id} is unprotected in this state", f"{isl.id}/{r.id}",
+                    "Give the relay an element in this group, or run the state in a group it has."))
+                continue
+            for e in act:
+                if e.ansi in PHASE_OC and e.pickup_a is not None:
+                    oc_elements.append((r, e))
+
+        for r, e in oc_elements:
+            scope = f"{isl.id}/{r.id}" if e.notes == LEGACY_ELEMENT else f"{isl.id}/{r.id}/{e.ansi}"
+            ratio = total_a / e.pickup_a
             if ratio < 1.0:
                 rep.findings.append(
                     Finding(
                         "protection",
                         Severity.FAIL,
                         f"available islanded fault current {total_a:,.0f} A is "
-                        f"below pickup {r.pickup_a:,.0f} A "
+                        f"below pickup {e.pickup_a:,.0f} A "
                         f"(ratio {ratio:.2f}); this relay will never operate",
-                        f"{isl.id}/{r.id}",
+                        scope,
                         "Islanded settings group, voltage-restrained or "
                         "voltage-controlled overcurrent, differential, or "
                         "communication-assisted scheme per IEEE 2030.12.",
@@ -562,7 +595,7 @@ def gate_protection(site: Site) -> GateReport:
                         f"fault current {total_a:,.0f} A gives only "
                         f"{ratio:.2f}x pickup, below the {PROTECTION_MARGIN}x "
                         f"dependability margin; operating time will be very long",
-                        f"{isl.id}/{r.id}",
+                        scope,
                         "Lower the islanded pickup or change scheme; do not rely "
                         "on an inverse curve this close to pickup.",
                     )
@@ -573,24 +606,57 @@ def gate_protection(site: Site) -> GateReport:
                         "protection",
                         Severity.PASS,
                         f"{ratio:.1f}x pickup available when islanded",
-                        f"{isl.id}/{r.id}",
+                        scope,
                     )
                 )
 
+        protected = [r for r in in_service if r.active(group)]
+        magnitude_only = [r.id for r in protected
+                          if not any(e.ansi in NOT_MAGNITUDE for e in r.active(group))]
         share = conv_a / total_a
-        if share >= CONVERTER_DOMINANCE:
+        if share >= CONVERTER_DOMINANCE and (magnitude_only or not protected):
             rep.findings.append(
                 Finding(
                     "protection",
                     Severity.WARN,
                     f"{share:.0%} of islanded fault current comes from "
                     f"current-limited converters; magnitude-based grading is "
-                    f"structurally marginal here even where the arithmetic passes",
+                    f"structurally marginal here even where the arithmetic passes"
+                    + (f" - primary protection rests on magnitude at {', '.join(magnitude_only[:8])}"
+                       + (f" and {len(magnitude_only) - 8} more" if len(magnitude_only) > 8 else "")
+                       if magnitude_only else ""),
                     isl.id,
                     "Treat overcurrent as backup only; primary protection should "
-                    "not depend on fault-current magnitude.",
+                    "not depend on fault-current magnitude (87L/87B, or 51V).",
                 )
             )
+        elif share >= CONVERTER_DOMINANCE:
+            rep.findings.append(Finding("protection", Severity.PASS,
+                f"{share:.0%} converter fault current, and every breaker in service has protection "
+                f"that does not rest on magnitude alone", isl.id))
+
+        # Breakers fed from both sides: non-directional overcurrent sees through-faults.
+        sw_by_id = {sw.id: sw for sw in site.switches}
+        src_bus = {s_.id: s_.bus for s_ in list(site.machines) + list(site.converters)}
+        energized = set(isl.energized_source_ids)
+        for r in protected:
+            act = r.active(group)
+            if any(e.directional for e in act) or not any(e.ansi in PHASE_OC | EARTH_OC for e in act):
+                continue
+            sw = sw_by_id[r.switch_id]
+            if sw.from_bus == sw.to_bus:
+                continue
+            cut = _sections(site, isl, open_extra=frozenset({sw.id}))
+            ends = (cut(sw.from_bus), cut(sw.to_bus))
+            if ends[0] == ends[1]:
+                continue
+            fed = [any(cut(src_bus[s_]) == e_ for s_ in energized if s_ in src_bus) for e_ in ends]
+            if all(fed):
+                rep.findings.append(Finding("protection", Severity.WARN,
+                    f"fault current reaches breaker {r.switch_id} from both sides (energised sources on "
+                    f"each); relay {r.id}'s non-directional overcurrent sees through-faults",
+                    f"{isl.id}/{r.id}",
+                    "Add a directional element (67 / 67N) or unit protection (87L) on this breaker."))
 
     return rep
 
@@ -825,10 +891,10 @@ def gate_energisation(site: Site) -> GateReport:
     return rep
 
 
-def _sections(site: Site, isl, without: frozenset = frozenset()):
-    """Union-find over an island's closed switches, branches and transformers (less `without`)."""
+def _sections(site: Site, isl, without: frozenset = frozenset(), open_extra: frozenset = frozenset()):
+    """Union-find over an island's closed switches (less `open_extra`), branches and transformers (less `without`)."""
     sw_by_id = {sw.id: sw for sw in site.switches}
-    opened = site.open_switch_ids(isl)
+    opened = site.open_switch_ids(isl) | set(open_extra)
     open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in opened if i in sw_by_id}
     parent = {b.id: b.id for b in site.buses}
 
