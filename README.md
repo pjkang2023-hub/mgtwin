@@ -83,6 +83,25 @@ is still enough information to separate them. The honest verdict is therefore
 `IDENTIFIED` with the trade-off named — not a refusal. A gate that cried wolf
 here would be ignored when it mattered.
 
+## The loading gate (v0.6.4)
+
+The grounding, forming and energisation gates check that a section has a
+zero-sequence path, a voltage reference and room for its inrush -- not that its
+sources can carry its load. CAMPAIGN-003 showed what that misses: a black-start
+state that left the halls' feeders closed on a 3 MVA genset (15-32 MVA of load)
+passed every gate, as did a 3.5 MVA IT transformer feeding a 12.5 MW hall cord.
+`gate_loading` takes each energised section of each islanded state and FAILs
+when its load's apparent power exceeds the rating of every source energised in
+it, storage included; WARNs when it exceeds the sustained sources' (the section
+runs on its batteries); and FAILs a transformer feeding more load than its
+rating on a side with no source of its own. It reasons on ratings, not a load
+flow, so a PASS is necessary, not sufficient. `gate_units` now also checks a
+transformer's reactance on its own rating (0.02-0.25 pu): a value given on the
+site's base -- x 1.0 for 6 % on 3 MVA at a 50 MVA base -- is caught.
+The loading gate treats a switch marked `normally_closed: false` as open in every
+state (a state lists only the switches it opens); the older gates still read
+such a switch as closed unless the state opens it.
+
 ## What is deliberately absent
 
 **No solvers.** Composition should target OpenDSS or pandapower for unbalanced

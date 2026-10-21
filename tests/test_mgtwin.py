@@ -994,8 +994,81 @@ def test_energisation_gate_fails_whole_section_and_passes_one_at_a_time():
     """Five 3 MVA transformers closed together exceed six 5.5 MVA PCS headroom; one at a time fits."""
     import json
     from mgtwin.gates import gate_energisation, Severity
-    site = Site.model_validate_json(open(__file__.replace("tests/test_mgtwin.py", "examples/c003_revC_site.json")).read())
+    site = Site.model_validate_json((Path(__file__).resolve().parent.parent / "examples" / "c003_revC_site.json").read_text())
     rep = gate_energisation(site)
     by = {str(f.scope).split("/")[0]: f.severity for f in rep.findings}
     assert by["FAST_TRANSFER_WHOLE_SECTION"] == Severity.FAIL
     assert by["SLOW_TRANSFER_ONE_GROUP"] in (Severity.PASS, Severity.WARN)
+
+
+def _revc_example():
+    return Site.model_validate_json((Path(__file__).resolve().parent.parent / "examples" / "c003_revC_site.json").read_text())
+
+
+def test_loading_gate_fails_a_black_start_carrying_the_halls():
+    """Rev C's BLACKSTART_GEN leaves the cord-A hall feeders closed on the 3 MVA genset: the grounding, forming and
+    energisation gates pass it; the loading gate does not. Its later black-start states, load breakers open, pass."""
+    from mgtwin.gates import gate_loading, Severity
+    rep = gate_loading(_revc_example())
+    worst = {}
+    for f in rep.findings:
+        isl = str(f.scope).split("/")[0]
+        rank = {Severity.PASS: 0, Severity.WARN: 1, Severity.FAIL: 2}
+        if rank[f.severity] >= rank[worst.get(isl, Severity.PASS)]:
+            worst[isl] = f.severity
+    assert worst["BLACKSTART_GEN"] == Severity.FAIL
+    assert worst["NORMAL"] == Severity.PASS
+    assert worst["BLACKSTART_GEN_FIRST_PCS_TR"] == Severity.PASS
+    assert any("exceeds the rating of every source" in f.message for f in rep.findings
+               if str(f.scope).startswith("BLACKSTART_GEN/"))
+
+
+def test_loading_gate_warns_when_storage_carries_the_load():
+    """PCS 1-2 forming BESS-1 with Aux A closed and no SOFC running: carried, but on the batteries."""
+    from mgtwin.gates import gate_loading, Severity
+    rep = gate_loading(_revc_example())
+    assert [f.severity for f in rep.findings if str(f.scope).startswith("BLACKSTART_BESS1_SOFC_PAIR/")] == [Severity.WARN]
+
+
+def test_loading_gate_fails_a_transformer_feeding_more_than_its_rating():
+    """A 3.5 MVA transformer feeding a 12.5 MW hall cord with no source behind it (Site v10's TR_IT_A): FAIL, in
+    every state that closes the cord's feeder."""
+    from mgtwin.gates import gate_loading, Severity
+    from mgtwin.ontology import Bus, Load, Transformer
+    site = _revc_example()
+    hall = next(ld for ld in site.loads if ld.p_mw > 5)
+    site.buses.append(Bus(id="HALL_LV", v_nom_kv=0.4))
+    site.transformers.append(Transformer(id="TR_HALL", hv_bus=hall.bus, lv_bus="HALL_LV", s_rated_mva=3.5,
+                                         hv_kv=33.0, lv_kv=0.4, x_pu=0.08, r_pu=0.006,
+                                         hv_config="delta", lv_config="wye_grounded"))
+    site.loads = [ld if ld.id != hall.id else Load(**{**ld.model_dump(), "bus": "HALL_LV"}) for ld in site.loads]
+    rep = gate_loading(site)
+    tr = [f for f in rep.findings if str(f.scope).endswith("/TR_HALL")]
+    assert tr and all(f.severity == Severity.FAIL for f in tr)
+    assert str(tr[0].scope).split("/")[0] == "NORMAL" or any(str(f.scope).startswith("NORMAL/") for f in tr)
+
+
+def test_units_gate_fails_transformer_reactance_on_the_system_base():
+    """Transformer.x_pu is on the transformer's own rating; a Site that gives it on the 50 MVA system base (x 1.0
+    for 6 % on 3 MVA) is caught, and one entered on its own rating is not."""
+    from mgtwin.gates import gate_units, Severity
+    site = _revc_example()
+    fails = [f for f in gate_units(site).findings if f.severity == Severity.FAIL and "transformer reactance" in f.message]
+    assert fails and "TR_SOFC01 1" in fails[0].message
+    for tx in site.transformers:
+        tx.x_pu = 0.06
+    assert not [f for f in gate_units(site).findings if "transformer reactance" in f.message]
+
+
+def test_loading_gate_keeps_normally_open_switches_open():
+    """A normally open tie or alternate leg is open in every state (a state lists only the switches it opens), so
+    it does not join the boards it ties; marked normally closed, it does."""
+    from mgtwin.gates import _sections
+    site = _revc_example()
+    apart = [(isl, sw) for isl in site.islands for sw in site.switches if not sw.normally_closed
+             and _sections(site, isl)(sw.from_bus) != _sections(site, isl)(sw.to_bus)]
+    assert apart
+    isl, sw = apart[0]
+    sw.normally_closed = True
+    find = _sections(site, isl)
+    assert find(sw.from_bus) == find(sw.to_bus)

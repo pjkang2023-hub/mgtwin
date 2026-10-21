@@ -25,7 +25,7 @@ from .ontology import (
     SynchronousGen,
     WindingConfig,
 )
-from .units import check_plausible
+from .units import PLAUSIBLE, check_plausible
 
 
 class Severity(str, Enum):
@@ -154,6 +154,25 @@ def gate_units(site: Site) -> GateReport:
             msg = check_plausible(name, val)
             if msg:
                 rep.findings.append(Finding("units", Severity.FAIL, msg, c.id))
+
+    # Transformer reactance: on its own rating a power transformer's is some 4-15 %. A value far
+    # outside that was entered on another base - the site's, typically - and scales every fault
+    # level and voltage drop through it.
+    off = [tx for tx in site.transformers if check_plausible("tx_x_pu", tx.x_pu)]
+    if off:
+        lo, hi = PLAUSIBLE["tx_x_pu"]
+        rep.findings.append(
+            Finding(
+                "units",
+                Severity.FAIL,
+                f"{len(off)} transformer reactance(s) outside [{lo:g}, {hi:g}] pu on their own rating: "
+                + ", ".join(f"{tx.id} {tx.x_pu:g}" for tx in off[:8])
+                + (f" and {len(off) - 8} more" if len(off) > 8 else ""),
+                site.id,
+                "Transformer.x_pu is on the transformer's own rating; rebase a system-base value "
+                "(x_own = x_sys * s_rated / s_base).",
+            )
+        )
 
     # Transformer ratio vs declared bus voltages.
     bus_kv = {b.id: b.v_nom_kv for b in site.buses}
@@ -796,7 +815,113 @@ def gate_energisation(site: Site) -> GateReport:
     return rep
 
 
-ALL_GATES = (gate_forming, gate_units, gate_grounding, gate_protection, gate_model_honesty, gate_energisation)
+def _sections(site: Site, isl, without: frozenset = frozenset()):
+    """
+    Union-find over an island's closed switches, branches and transformers (less `without`).
+    A switch is closed when it is normally closed and the state does not open it. A normally
+    open tie or alternate leg stays open: a state can only list switches it opens.
+    """
+    sw_by_id = {sw.id: sw for sw in site.switches}
+    opened = set(isl.open_switches) | {sw.id for sw in site.switches if not sw.normally_closed}
+    open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in opened if i in sw_by_id}
+    parent = {b.id: b.id for b in site.buses}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        if frozenset((a, b)) in open_pairs:
+            return
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for br in site.branches:
+        union(br.from_bus, br.to_bus)
+    for tx in site.transformers:
+        if tx.id not in without:
+            union(tx.hv_bus, tx.lv_bus)
+    for sw in site.switches:
+        if sw.id not in opened:
+            union(sw.from_bus, sw.to_bus)
+    return find
+
+
+def gate_loading(site: Site) -> GateReport:
+    """
+    Loading gate: can the sources a state energises carry the load it leaves connected?
+
+    The other gates check that a section has a voltage reference, a zero-sequence path and
+    room for its inrush - not that its sources can carry its load. A black-start state that
+    leaves the halls' feeders closed on a 3 MVA genset passes all of them. Per energised
+    section of each islanded state: FAIL when the load's apparent power exceeds the rating
+    of every source energised in it, storage included; WARN when it exceeds the sustained
+    sources' (machines and converters without storage) - the section then runs on its
+    batteries; and FAIL for a transformer feeding a side with no source of its own whose load
+    exceeds its rating. Ratings, not a load flow: losses, voltage and temperature derating are not
+    counted, so a PASS is necessary, not sufficient. Unlike the other gates, it honours
+    `normally_closed`: a normally open tie or alternate leg is open in every state.
+    """
+    rep = GateReport()
+    tx_by_id = {t.id: t for t in site.transformers}
+    srcs = {s_.id: s_ for s_ in list(site.machines) + list(site.converters)}
+
+    def s_load(buses):
+        p = sum(ld.p_mw for ld in site.loads if ld.bus in buses)
+        q = sum(ld.q_mvar for ld in site.loads if ld.bus in buses)
+        return (p * p + q * q) ** 0.5
+
+    for isl in site.islands:
+        if isl.grid_connected or not isl.energized_source_ids:
+            continue
+        find = _sections(site, isl)
+        energized = [srcs[i] for i in isl.energized_source_ids if i in srcs]
+        roots = {find(s_.bus) for s_ in energized}
+        for r in roots:
+            buses = {b.id for b in site.buses if find(b.id) == r}
+            here = [s_ for s_ in energized if s_.bus in buses]
+            total = sum(s_.s_rated_mva for s_ in here)
+            sustained = sum(s_.s_rated_mva for s_ in here if not getattr(s_, "energy_mwh", None))
+            load = s_load(buses)
+            label = f"{isl.id}/loading({_zone_name(site, buses)})"
+            if load > total * 1.0 + 1e-9:
+                rep.findings.append(Finding("loading", Severity.FAIL,
+                    f"the section's load {load:.2f} MVA exceeds the rating of every source energised in it, "
+                    f"{total:.2f} MVA ({len(here)} source(s)): it cannot be carried", label,
+                    "Open the feeders of the loads the state does not intend to carry (as a black-start "
+                    "step should), or energise more sources."))
+            elif load > sustained + 1e-9 and total > sustained:
+                rep.findings.append(Finding("loading", Severity.WARN,
+                    f"the section's load {load:.2f} MVA exceeds its sustained sources' {sustained:.2f} MVA: "
+                    f"it runs on storage ({total - sustained:.2f} MVA of it)", label,
+                    "Check the storage's energy against how long the state lasts."))
+            else:
+                rep.findings.append(Finding("loading", Severity.PASS,
+                    f"load {load:.2f} MVA within {sustained:.2f} MVA sustained, {total:.2f} MVA in all", label))
+            # Transformers carrying load with no source behind them.
+            for tx in site.transformers:
+                if tx.hv_bus not in buses:
+                    continue
+                cut = _sections(site, isl, frozenset({tx.id}))
+                for end in (tx.hv_bus, tx.lv_bus):
+                    side = {b.id for b in site.buses if cut(b.id) == cut(end)}
+                    if side == buses or any(s_.bus in side for s_ in here):
+                        continue
+                    behind = s_load(side)
+                    if behind > tx.s_rated_mva * 1.0 + 1e-9:
+                        rep.findings.append(Finding("loading", Severity.FAIL,
+                            f"{tx.id} ({tx.s_rated_mva:g} MVA) feeds {behind:.2f} MVA of load on a side with "
+                            f"no source of its own ({100 * behind / tx.s_rated_mva:.0f} %)", f"{isl.id}/{tx.id}",
+                            "Size the transformer (or its bank) for the load it feeds - for dual-corded "
+                            "loads, the whole load when the other cord is lost."))
+    return rep
+
+
+ALL_GATES = (gate_forming, gate_units, gate_grounding, gate_protection, gate_model_honesty, gate_energisation,
+             gate_loading)
 
 
 def run_all(site: Site) -> GateReport:

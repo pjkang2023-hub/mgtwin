@@ -114,6 +114,7 @@ PLAUSIBLE = {
     "h_sec": (0.0, 20.0),  # virtual/real inertia constant
     "tp_sec": (1e-3, 5.0),  # power measurement filter
     "i_limit_pu": (0.8, 3.0),  # converter current limit on own rating
+    "tx_x_pu": (0.02, 0.25),  # power transformer reactance on its own rating
 }
 
 
