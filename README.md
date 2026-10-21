@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.8 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.9 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -30,7 +30,7 @@ Run the demonstration:
 ```bash
 pip install pydantic numpy scipy pyyaml
 python examples/demo.py
-python -m pytest tests/ -q      # 73 tests; 8 skip without the Banshee data (set BANSHEE_DATA)
+python -m pytest tests/ -q      # 76 tests; 8 skip without the Banshee data (set BANSHEE_DATA)
 ```
 
 ## Three design decisions worth arguing about
@@ -111,7 +111,7 @@ state cannot both open and close one switch. The energisation gate FAILs a
 step whose transformer no energised source reaches ("the step energises
 nothing"), so a state that forgets to close a leg is caught rather than passed.
 
-## Protection: what mgtwin declares and screens, what a study decides (v0.6.8)
+## Protection: what mgtwin declares and screens, what a study decides (v0.6.8-v0.6.9)
 
 The split: the Site is the single record of the breakers and the relay
 settings installed on them; mgtwin screens those settings from ratings; a
@@ -134,21 +134,35 @@ in its group: a closed breaker with no element active is unprotected (FAIL -
 the black-start group a relay was never given); every 50/51/67 pickup against
 the available converter-limited fault current with the 1.5x dependability
 margin (FAIL); in a converter-dominated state, the breakers whose primary
-protection rests on magnitude alone - no 87, 21 or 51V - are named (WARN), and
-a PASS when none does; a breaker that fault current reaches from both sides
-with only non-directional overcurrent sees through-faults (WARN: it needs 67
-or 87L). On Banshee's ISL_ALL that last check finds each feeder head fed back
-by the other feeders' DER. Earth-fault elements are not screened by
-magnitude: their current is the zero-sequence path's.
+protection rests on magnitude alone are named (WARN), and a PASS when none
+does - a unit element counts for a breaker only when its zones take in both
+sides of it (a feeder's 87L, a bus section between two 87B zones), not a
+board's 87B on a breaker leaving the board (v0.6.9). A breaker fed from both
+sides with only non-directional overcurrent sees the through-faults the far
+side can drive (WARN), judged for phase and earth apart since v0.6.9: phase,
+when that side's fault contribution exceeds the 1.5x margin over its rating -
+a machine's 1/x'', not a converter's 1.1-1.5 pu, which a pickup above load
+does not see (those breakers are counted in one PASS); earth, when each side
+has an earthing source - the two neutrals in parallel a non-directional 51N
+cannot locate. A 67N covers earth faults, not phase ones. On Banshee's ISL_ALL
+the check finds each feeder head fed back by the diesel on another feeder.
+Phase elements declared without a pickup - a design whose setting study is
+still open - are named in one WARN per state rather than passed silently, and
+a relay's CT ratio may be left undeclared. Earth-fault elements are not
+screened by magnitude: their current is the zero-sequence path's.
 
 **Decided by a study.** `build_envelope(..., protection_studies=[...])` takes
 a `ProtectionStudyRecord` per state studied (`load_protection_studies` reads
 them from JSON: state, tool, passed, whether the converter models were
-identified, reference). For those states the study supersedes the screening:
-a failed study puts protection OUTSIDE; a passed one on identified models
-INSIDE, on assumed ones PROVISIONAL naming the study; a passed study also
-lifts a protection-gate screening FAIL, since it computed the currents the
-screening only bounds. States no study covers keep the screening's verdict.
+identified, whether it covered the whole state, reference; fields it does not
+know - a tool's working detail kept beside the record - are skipped). For
+those states the study supersedes the screening: a failed study puts
+protection OUTSIDE; a passed one on identified models INSIDE, on assumed ones
+PROVISIONAL naming the study; a study that covered part of the state only
+(`complete` False, v0.6.9) leaves it PROVISIONAL and says what it left out. A
+passed, complete study also lifts a protection-gate screening FAIL, since it
+computed the currents the screening only bounds. States no study covers keep
+the screening's verdict.
 
 ## Banshee transformer ratings (v0.6.7)
 

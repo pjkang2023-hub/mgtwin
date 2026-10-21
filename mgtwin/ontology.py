@@ -216,7 +216,7 @@ class OvercurrentRelay(BaseModel):
 
     id: str
     switch_id: str
-    ct_ratio: float = Field(gt=0.0, description="e.g. 600.0 for 600:5")
+    ct_ratio: float | None = Field(None, gt=0.0, description="e.g. 600.0 for 600:5; None until the design declares it")
     pickup_a: float | None = Field(None, gt=0.0, description="Primary amperes")
     curve: str = "IEC-VI"
     time_dial: float | None = Field(None, gt=0.0)

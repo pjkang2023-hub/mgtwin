@@ -1257,19 +1257,26 @@ def test_banshee_transformers_paired_by_impedance_on_their_own_rating():
 # ---------------------------------------------------------------------------
 
 
-def _two_bess_site(functions=None, pickup_a=None, groups=("A",), state_group="A"):
-    """Two 5 MVA grid-forming BESS on B1 and B2, tied by breaker SW; its relay carries `functions`."""
-    from mgtwin.ontology import ProtectionFunction  # noqa: F401
+def _two_bess_site(functions=None, pickup_a=None, groups=("A",), state_group="A", genset=False, earthed=False):
+    """
+    Two 5 MVA grid-forming BESS on B1 and B2, tied by breaker SW; its relay carries `functions`. `genset` puts a
+    1 MVA machine (x'' 0.15: 6.7x its rated current into a fault) on B2 beside BESS2; `earthed` a low-resistance
+    earthing source on each bus.
+    """
+    from mgtwin.ontology import GroundingKind, GroundingSource, SynchronousGen
     bess = lambda i, b: Converter(id=i, bus=b, s_rated_mva=5.0, control=ConverterControl.GFM_DROOP,  # noqa: E731
                                   params=ConverterParams(p_f_droop_pu=0.05, i_limit_transient_pu=1.2))
     return _minimal_site(
         buses=[Bus(id="B1", v_nom_kv=11.0), Bus(id="B2", v_nom_kv=11.0)],
         converters=[bess("BESS1", "B1"), bess("BESS2", "B2")],
+        machines=[SynchronousGen(id="GEN", bus="B2", s_rated_mva=1.0, h_sec=1.0, xd_subtransient_pu=0.15)] if genset else [],
+        grounding=[GroundingSource(id=f"G{b}", bus=b, kind=GroundingKind.LOW_RESISTANCE, z0_ohm=20.0,
+                                   available_when_islanded=True) for b in ("B1", "B2")] if earthed else [],
         switches=[Switch(id="SW", from_bus="B1", to_bus="B2")],
         relays=[OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=pickup_a,
                                  functions=list(functions or []))],
         islands=[IslandConfig(id="I1", grid_connected=False, settings_group=state_group,
-                              energized_source_ids=["BESS1", "BESS2"])],
+                              energized_source_ids=["BESS1", "BESS2"] + (["GEN"] if genset else []))],
     )
 
 
@@ -1319,14 +1326,20 @@ def test_protection_gate_names_magnitude_only_breakers_and_passes_unit_protectio
 
 
 def test_protection_gate_wants_direction_on_a_breaker_fed_from_both_sides():
-    """BESS on each side of SW: a non-directional 51 sees through-faults; a 67 or an 87L does not need the WARN."""
+    """A genset beside BESS2 drives 6.7x its rating through SW into a fault on B1: a non-directional 51 sees the
+    through-fault; a 67 or an 87L does not need the WARN. With converters alone on each side the through-fault is
+    within 1.5x their rating - a pickup above load does not see it, and the gate says so in one PASS."""
     from mgtwin.ontology import ProtectionFunction
     both_sides = lambda rep: [f for f in rep.by_severity(Severity.WARN) if "from both sides" in f.message]  # noqa: E731
-    assert both_sides(gate_protection(_two_bess_site(pickup_a=150.0)))
+    (w,) = both_sides(gate_protection(_two_bess_site(pickup_a=150.0, genset=True)))
+    assert "the far side gives 2.1x its rated current" in w.message   # (5 x 1.2 + 1 / 0.15) / 6 MVA
     assert not both_sides(gate_protection(_two_bess_site(
-        [ProtectionFunction(ansi="67", pickup_a=150.0, direction="forward")])))
+        [ProtectionFunction(ansi="67", pickup_a=150.0, direction="forward")], genset=True)))
     assert not both_sides(gate_protection(_two_bess_site(
-        [ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"])], pickup_a=150.0)))
+        [ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"])], pickup_a=150.0, genset=True)))
+    rep = gate_protection(_two_bess_site(pickup_a=150.0))
+    assert not both_sides(rep)
+    assert any("fed from both sides by converters only" in f.message for f in rep.by_severity(Severity.PASS))
 
 
 def test_envelope_takes_protection_studies(tmp_path):
@@ -1353,3 +1366,53 @@ def test_envelope_takes_protection_studies(tmp_path):
     assert "## Protection studies" in env.render() and env.to_dict()["protection_studies"]["N1_PCS"]["passed"]
     with pytest.raises(ValueError, match="does not enumerate"):
         build_envelope(site, protection_studies=[ProtectionStudyRecord("NOPE", "Electrisim", True)])
+
+
+def test_direction_is_screened_for_phase_and_earth_faults_separately():
+    """A 67N covers earth through-faults, not phase ones: 51 + 67N on a breaker fed from both sides still wants a
+    67 for phase faults; 67 + 51N wants a 67N; 67 + 67N or an 87L wants nothing. Unset phase pickups are named."""
+    from mgtwin.ontology import ProtectionFunction as PF
+    def warns(fns):
+        rep = gate_protection(_two_bess_site(fns, genset=True, earthed=True))
+        return [f.message + " | " + f.remedy for f in rep.by_severity(Severity.WARN) if "from both sides" in f.message]
+    (w,) = warns([PF(ansi="51", pickup_a=150.0), PF(ansi="67N", pickup_a=40.0, direction="forward")])
+    assert "sees through-faults: phase" in w and "(67)" in w
+    (w,) = warns([PF(ansi="67", pickup_a=150.0, direction="forward"), PF(ansi="51N", pickup_a=40.0)])
+    assert "sees through-faults: earth" in w and "(67N)" in w
+    assert not warns([PF(ansi="67", pickup_a=150.0, direction="forward"), PF(ansi="67N", pickup_a=40.0, direction="forward")])
+    assert not warns([PF(ansi="51", pickup_a=150.0), PF(ansi="87L", zone_buses=["B1", "B2"])])
+    rep = gate_protection(_two_bess_site([PF(ansi="51"), PF(ansi="67N", direction="forward")]))
+    (u,) = [f for f in rep.by_severity(Severity.WARN) if f.scope == "I1/unset"]
+    assert "1 phase overcurrent element(s) with no pickup set are not screened: R 51" in u.message
+
+
+def test_a_board_87B_does_not_protect_the_circuit_leaving_it():
+    """87B on a breaker's board covers one side of it: the circuit beyond still rests on its overcurrent (named in
+    the converter-dominance WARN, and fed from both sides it wants direction). Zones on both sides - an 87L, or a
+    bus section between two 87B zones - cover it."""
+    from mgtwin.ontology import ProtectionFunction as PF
+    def screen(fns):
+        mag = gate_protection(_two_bess_site(fns))
+        both = gate_protection(_two_bess_site(fns, genset=True))
+        return ([f.message for f in mag.by_severity(Severity.WARN) if "rests on magnitude at R" in f.message],
+                [f.message for f in both.by_severity(Severity.WARN) if "from both sides" in f.message])
+    mag, both = screen([PF(ansi="51", pickup_a=150.0), PF(ansi="87B", zone_buses=["B1"])])
+    assert mag and both
+    mag, both = screen([PF(ansi="51", pickup_a=150.0), PF(ansi="87B", zone_buses=["B1"]), PF(ansi="87B", zone_buses=["B2"])])
+    assert not mag and not both
+
+
+def test_envelope_a_partial_study_keeps_the_state_provisional():
+    """A study that passed the cables it could compute but not the bus breakers: provisional, naming the gap, even
+    on identified models; a partial study that finds a failure still puts the state outside."""
+    from mgtwin.envelope import Inside, ProtectionStudyRecord, build_envelope
+    site = _revc_rebased()
+    env = build_envelope(site, protection_studies=[
+        ProtectionStudyRecord("N1_PCS", "Electrisim", True, models_identified=True, complete=False,
+                              notes="bus-coupler breakers not studied"),
+        ProtectionStudyRecord("NORMAL", "Electrisim", False, complete=False)])
+    v, why = env.check("N1_PCS", "protection")
+    assert v == Inside.PROVISIONAL and why == ["the Electrisim study covers part of this state's protection only: "
+                                               "bus-coupler breakers not studied"]
+    assert env.check("NORMAL", "protection")[0] == Inside.OUTSIDE
+    assert "| partial |" in env.render()

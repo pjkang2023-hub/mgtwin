@@ -97,7 +97,9 @@ class ProtectionStudyRecord:
     A protection study's verdict on one state, from the tool that computes fault currents
     (Electrisim: IEC 60909 and EMT fault levels at each relay, grading, settings). `passed` is
     the study's own conclusion; `models_identified` says whether its converter current limits and
-    ride-through were identified from measured response or the vendors' assumed models.
+    ride-through were identified from measured response or the vendors' assumed models;
+    `complete` False when it covered only part of the state's protection (`notes` says what not) -
+    a pass then stands for what it covered, and the state stays PROVISIONAL.
     """
 
     state_id: str
@@ -106,12 +108,18 @@ class ProtectionStudyRecord:
     models_identified: bool = False
     reference: str = ""
     notes: str = ""
+    complete: bool = True
 
 
 def load_protection_studies(path) -> list[ProtectionStudyRecord]:
-    """Records from a JSON list of {state_id, tool, passed, models_identified?, reference?, notes?}."""
+    """
+    Records from a JSON list of {state_id, tool, passed, models_identified?, reference?, notes?, complete?}; other
+    fields - a tool's own working detail beside the record - are left out.
+    """
+    from dataclasses import fields
+    known = {f.name for f in fields(ProtectionStudyRecord)}
     with open(path, encoding="utf-8") as f:
-        return [ProtectionStudyRecord(**r) for r in json.load(f)]
+        return [ProtectionStudyRecord(**{k: v for k, v in r.items() if k in known}) for r in json.load(f)]
 
 
 @dataclass
@@ -154,7 +162,8 @@ class Envelope:
         else:
             excl = st.excluded.get(ph.value, [])
             passed_study = self.protection_studies.get(state_id)
-            if ph == Phenomenon.PROTECTION and passed_study is not None and passed_study.passed:
+            if ph == Phenomenon.PROTECTION and passed_study is not None and passed_study.passed \
+                    and passed_study.complete:
                 # the study computed the fault currents the screening only bounds from ratings
                 excl = [x for x in excl if not x.startswith("protection:")]
             if excl:
@@ -184,10 +193,14 @@ class Envelope:
                 if not study.passed:
                     out.append(f"the {study.tool} protection study finds this state's protection fails"
                                + (f" ({study.reference})" if study.reference else ""))
-                elif not study.models_identified:
-                    prov.append(f"studied in {study.tool}"
-                                + (f" ({study.reference})" if study.reference else "")
-                                + " on assumed converter current limits and ride-through")
+                else:
+                    if not study.complete:
+                        prov.append(f"the {study.tool} study covers part of this state's protection only"
+                                    + (f": {study.notes}" if study.notes else ""))
+                    if not study.models_identified:
+                        prov.append(f"studied in {study.tool}"
+                                    + (f" ({study.reference})" if study.reference else "")
+                                    + " on assumed converter current limits and ride-through")
             elif ph == Phenomenon.PROTECTION:
                 assumed = [s for s in st.sources if s in self.ride_through_assumed]
                 if assumed:
@@ -216,8 +229,9 @@ class Envelope:
             "assumed_sources": self.assumed_sources,
             "ride_through_assumed": self.ride_through_assumed,
             "undeclared": self.undeclared,
-            "protection_studies": {k: {"tool": r.tool, "passed": r.passed, "models_identified": r.models_identified,
-                                       "reference": r.reference} for k, r in self.protection_studies.items()},
+            "protection_studies": {k: {"tool": r.tool, "passed": r.passed, "complete": r.complete,
+                                       "models_identified": r.models_identified, "reference": r.reference,
+                                       "notes": r.notes} for k, r in self.protection_studies.items()},
         }
 
     def to_json(self, path=None) -> str:
@@ -249,8 +263,10 @@ class Envelope:
         if self.ride_through_assumed:
             L.append(f"- current limit / ride-through assumed: {', '.join(self.ride_through_assumed)}")
         if self.protection_studies:
-            L += ["", "## Protection studies", "", "| State | Tool | Verdict | Models | Reference |", "|---|---|---|---|---|"]
+            L += ["", "## Protection studies", "", "| State | Tool | Verdict | Coverage | Models | Reference |",
+                  "|---|---|---|---|---|---|"]
             L += [f"| {r.state_id} | {r.tool} | {'passed' if r.passed else 'FAILS'} | "
+                  f"{'complete' if r.complete else 'partial'} | "
                   f"{'identified' if r.models_identified else 'assumed'} | {r.reference} |"
                   for r in self.protection_studies.values()]
         if self.undeclared:

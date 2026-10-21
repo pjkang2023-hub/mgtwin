@@ -24,6 +24,7 @@ from .ontology import (
     LEGACY_ELEMENT,
     NOT_MAGNITUDE,
     PHASE_OC,
+    UNIT,
     GroundingKind,
     Site,
     SynchronousGen,
@@ -507,10 +508,14 @@ def gate_protection(site: Site) -> GateReport:
       * every phase overcurrent element with a pickup (50, 51, 67) against the
         available fault current, with the dependability margin;
       * converter-dominated states: the breakers whose primary protection rests
-        on magnitude alone (no 87, 21 or 51V element) are named in a WARN;
-      * a breaker that fault current reaches from both sides (energised sources
-        on each) with only non-directional overcurrent sees through-faults:
-        WARN, it needs direction (67) or unit protection.
+        on magnitude alone (no 21 or 51V element, and no unit element whose
+        zones cover both sides of the breaker) are named in a WARN;
+      * a breaker fed from both sides with only non-directional overcurrent sees
+        the through-faults the far side can drive: phase, when that side's fault
+        contribution exceeds the margin times its rating (a machine's, not a
+        converter's 1.1-1.5 pu); earth, when each side has an earthing source.
+        WARN, it needs direction (67 / 67N) or unit protection;
+      * phase elements whose pickup is not yet set are named, not screened (WARN).
     Earth-fault elements are not screened: their current is the zero-sequence
     path's. Screening only - grading, settings and fault levels are a
     protection study's (Electrisim), whose results the envelope takes.
@@ -557,7 +562,7 @@ def gate_protection(site: Site) -> GateReport:
         in_service = [r for r in site.relays if r.switch_id not in open_sw]
         group = isl.settings_group
 
-        oc_elements = []
+        oc_elements, unset = [], []
         for r in in_service:
             act = r.active(group)
             if not act:
@@ -569,6 +574,14 @@ def gate_protection(site: Site) -> GateReport:
             for e in act:
                 if e.ansi in PHASE_OC and e.pickup_a is not None:
                     oc_elements.append((r, e))
+                elif e.ansi in PHASE_OC:
+                    unset.append(f"{r.id} {e.ansi}")
+        if unset:
+            rep.findings.append(Finding("protection", Severity.WARN,
+                f"{len(unset)} phase overcurrent element(s) with no pickup set are not screened: "
+                + ", ".join(unset[:8]) + (f" and {len(unset) - 8} more" if len(unset) > 8 else ""),
+                f"{isl.id}/unset",
+                "Declare the settings once the setting study has them (pickup in primary amperes)."))
 
         for r, e in oc_elements:
             scope = f"{isl.id}/{r.id}" if e.notes == LEGACY_ELEMENT else f"{isl.id}/{r.id}/{e.ansi}"
@@ -611,8 +624,17 @@ def gate_protection(site: Site) -> GateReport:
                 )
 
         protected = [r for r in in_service if r.active(group)]
+        sw_ends = {sw.id: (sw.from_bus, sw.to_bus) for sw in site.switches}
+
+        def unit_covers(r, act):
+            """A unit element protects the breaker's circuit only if its zones take in both sides of the breaker
+            (a feeder's 87L, a bus section between two 87B zones) - not a board's 87B on a breaker leaving it."""
+            zone = {b for e in act if e.ansi in UNIT for b in e.zone_buses}
+            return set(sw_ends[r.switch_id]) <= zone
+
         magnitude_only = [r.id for r in protected
-                          if not any(e.ansi in NOT_MAGNITUDE for e in r.active(group))]
+                          if not unit_covers(r, r.active(group))
+                          and not any(e.ansi in NOT_MAGNITUDE - UNIT for e in r.active(group))]
         share = conv_a / total_a
         if share >= CONVERTER_DOMINANCE and (magnitude_only or not protected):
             rep.findings.append(
@@ -635,13 +657,26 @@ def gate_protection(site: Site) -> GateReport:
                 f"{share:.0%} converter fault current, and every breaker in service has protection "
                 f"that does not rest on magnitude alone", isl.id))
 
-        # Breakers fed from both sides: non-directional overcurrent sees through-faults.
+        # Breakers fed from both sides: non-directional overcurrent sees a through-fault the far side can drive.
+        # Phase: the far side's fault contribution above PROTECTION_MARGIN x its rated current (a synchronous
+        # machine's 1/x''; a converter's 1.1-1.5 pu is not - a pickup above its load with margin does not see
+        # it). Earth: an earthing source on each side at the breaker's voltage. Unless a 67 / 67N or a unit
+        # element covering the breaker's circuit is there.
         sw_by_id = {sw.id: sw for sw in site.switches}
-        src_bus = {s_.id: s_.bus for s_ in list(site.machines) + list(site.converters)}
-        energized = set(isl.energized_source_ids)
+        kv = {b.id: b.v_nom_kv for b in site.buses}
+        srcs = [site.source(s_) for s_ in isl.energized_source_ids]
+        earths = [g.bus for g in site.grounding
+                  if g.kind != GroundingKind.UNGROUNDED and g.available_when_islanded]
+        earths += [tx.hv_bus if side == "hv" else tx.lv_bus for tx in site.transformers for side in ("hv", "lv")
+                   if tx.provides_zero_sequence_path_to(side)]
+        low_ratio = []
         for r in protected:
             act = r.active(group)
-            if any(e.directional for e in act) or not any(e.ansi in PHASE_OC | EARTH_OC for e in act):
+            unit = unit_covers(r, act)
+            blind = [kind for kind, oc in (("phase", PHASE_OC), ("earth", EARTH_OC))
+                     if not unit and any(e.ansi in oc and not e.directional for e in act)
+                     and not any(e.ansi in oc and e.directional for e in act)]
+            if not blind:
                 continue
             sw = sw_by_id[r.switch_id]
             if sw.from_bus == sw.to_bus:
@@ -650,13 +685,35 @@ def gate_protection(site: Site) -> GateReport:
             ends = (cut(sw.from_bus), cut(sw.to_bus))
             if ends[0] == ends[1]:
                 continue
-            fed = [any(cut(src_bus[s_]) == e_ for s_ in energized if s_ in src_bus) for e_ in ends]
-            if all(fed):
+            seen = []
+            if "phase" in blind:
+                ratios = []
+                for e_ in ends:
+                    side = [x for x in srcs if cut(x.bus) == e_]
+                    rated = sum(x.s_rated_mva for x in side) * 1e6 / (3 ** 0.5 * site.base.v_base_kv * 1e3)
+                    ratios.append(sum(x.fault_contribution_a(site.base) for x in side) / rated if rated else 0.0)
+                if min(ratios) > 0 and max(ratios) > PROTECTION_MARGIN:
+                    seen.append(f"phase (the far side gives {max(ratios):.1f}x its rated current)")
+                elif min(ratios) > 0:
+                    low_ratio.append(r.switch_id)
+            if "earth" in blind:
+                at_kv = [b for b in earths if abs(kv.get(b, 0) - kv[sw.from_bus]) < 1e-6]
+                if all(any(cut(b) == e_ for b in at_kv) for e_ in ends):
+                    seen.append("earth (an earthing source on each side)")
+            if seen:
+                kinds = [k.split(" ")[0] for k in seen]
                 rep.findings.append(Finding("protection", Severity.WARN,
-                    f"fault current reaches breaker {r.switch_id} from both sides (energised sources on "
-                    f"each); relay {r.id}'s non-directional overcurrent sees through-faults",
+                    f"breaker {r.switch_id} is fed from both sides; relay {r.id}'s non-directional overcurrent "
+                    f"sees through-faults: {'; '.join(seen)}",
                     f"{isl.id}/{r.id}",
-                    "Add a directional element (67 / 67N) or unit protection (87L) on this breaker."))
+                    "Add a directional element (" + " / ".join({"phase": "67", "earth": "67N"}[k] for k in kinds)
+                    + ") or unit protection (87L) on this breaker."))
+        if low_ratio:
+            rep.findings.append(Finding("protection", Severity.PASS,
+                f"{len(low_ratio)} breaker(s) fed from both sides by converters only, whose fault current is within "
+                f"{PROTECTION_MARGIN}x their rating: a phase pickup above load with margin does not see the "
+                f"through-fault (" + ", ".join(low_ratio[:6]) + (" ..." if len(low_ratio) > 6 else "") + ")",
+                f"{isl.id}/through-faults"))
 
     return rep
 
