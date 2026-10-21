@@ -2176,7 +2176,11 @@
     "PCS3",
     "PCS4",
     "PCS6"
-   ]
+   ],
+   "load_factors": {
+    "DH3_cordB": 2.0,
+    "DH4_cordB": 2.0
+   }
   },
   {
    "id": "BLACKSTART_BESS1",

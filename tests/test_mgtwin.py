@@ -1416,3 +1416,33 @@ def test_envelope_a_partial_study_keeps_the_state_provisional():
                                                "bus-coupler breakers not studied"]
     assert env.check("NORMAL", "protection")[0] == Inside.OUTSIDE
     assert "| partial |" in env.render()
+
+
+
+# ---------------------------------------------------------------------------
+# v0.6.10: load transfers in a state
+# ---------------------------------------------------------------------------
+
+
+def test_a_state_moves_load():
+    """When a board is lost the dual-corded halls move to the other cord: the state says so with a load factor,
+    and the loading gate sums the moved load - and a factor for an unknown load, or a negative one, is refused."""
+    import pytest
+    from mgtwin.gates import gate_loading
+    from mgtwin.ontology import Site
+    site = _revc_rebased()
+    isl = next(i for i in site.islands if i.id == "MVA_BUS_FAULT")
+    cord_b = next(ld for ld in site.loads if "cordB" in ld.id or "cord_B" in ld.id)
+    before = {f.scope: f.message for f in gate_loading(site).findings if f.scope.startswith("MVA_BUS_FAULT/loading")}
+    isl.load_factors = {cord_b.id: 2.0}
+    after = {f.scope: f.message for f in gate_loading(site).findings if f.scope.startswith("MVA_BUS_FAULT/loading")}
+    (ld, p, q), = [x for x in site.state_loads(isl) if x[0].id == cord_b.id]
+    assert p == 2 * cord_b.p_mw and q == 2 * cord_b.q_mvar
+    assert before != after
+    raw = site.model_dump(mode="json")
+    next(i for i in raw["islands"] if i["id"] == "MVA_BUS_FAULT")["load_factors"] = {"NOPE": 2.0}
+    with pytest.raises(ValueError, match="scales unknown load"):
+        Site.model_validate(raw)
+    next(i for i in raw["islands"] if i["id"] == "MVA_BUS_FAULT")["load_factors"] = {cord_b.id: -1.0}
+    with pytest.raises(ValueError, match="negative factor"):
+        Site.model_validate(raw)

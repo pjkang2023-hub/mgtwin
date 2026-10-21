@@ -134,7 +134,7 @@ def _island_load_mw(site: Site, isl: IslandConfig) -> float:
 
     zones, _ = _zero_sequence_zones(site, isl)
     buses = set().union(*zones) if zones else set()
-    return sum(ld.p_mw for ld in site.loads if ld.bus in buses)
+    return sum(p for ld, p, _ in site.state_loads(isl) if ld.bus in buses)
 
 
 # ---------------------------------------------------------------------------

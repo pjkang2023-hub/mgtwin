@@ -829,7 +829,7 @@ def gate_forming(site: Site) -> GateReport:
         energized = set(isl.energized_source_ids)
         src_bus = {s_.id: s_.bus for s_ in list(site.machines) + list(site.converters)}
         sections: dict = {}
-        for sid in energized:
+        for sid in sorted(energized):
             r = find(src_bus[sid])
             d = sections.setdefault(r, {"gfm": set(), "gfl": set()})
             (d["gfm"] if sid in gfm_ids else d["gfl"]).add(sid)
@@ -837,7 +837,7 @@ def gate_forming(site: Site) -> GateReport:
             buses = {b.id for b in site.buses if find(b.id) == r}
             kv = sorted({b.v_nom_kv for b in site.buses if b.id in buses})
             label = f"{isl.id}/section({_zone_name(site, buses)})"
-            mw = sum(ld.p_mw for ld in site.loads if ld.bus in buses)
+            mw = sum(p for ld, p, _ in site.state_loads(isl) if ld.bus in buses)
             if d["gfm"]:
                 rep.findings.append(Finding("forming", Severity.PASS,
                     f"{len(d['gfm'])} grid-forming source(s) {sorted(d['gfm'])} for "
@@ -903,7 +903,7 @@ def gate_energisation(site: Site) -> GateReport:
         energized = set(isl.energized_source_ids)
         txs = [tx_by_id[t] for t in isl.energise_transformer_ids if t in tx_by_id]
         roots = {find(tx.hv_bus) for tx in txs}
-        for r in roots:
+        for r in sorted(roots):
             buses = {b.id for b in site.buses if find(b.id) == r}
             step = [tx for tx in txs if find(tx.hv_bus) == r]
             if not any(s_.bus in buses for s_ in list(site.machines) + list(site.converters) if s_.id in energized):
@@ -917,7 +917,7 @@ def gate_energisation(site: Site) -> GateReport:
                           if c.id in energized and c.bus in buses and c.control != ConverterControl.GFL)
             mach_mva = sum(m.s_rated_mva / max(m.xd_subtransient_pu, 0.05) for m in site.machines
                            if m.id in energized and m.bus in buses)
-            load_mva = sum((ld.p_mw ** 2 + ld.q_mvar ** 2) ** 0.5 for ld in site.loads if ld.bus in buses)
+            load_mva = sum((p ** 2 + q ** 2) ** 0.5 for ld, p, q in site.state_loads(isl) if ld.bus in buses)
             gfl_mva = sum(c.s_rated_mva for c in site.converters
                           if c.id in energized and c.bus in buses and c.control == ConverterControl.GFL)
             # the forming units already carry whatever the grid-following fleet does not;
@@ -997,9 +997,9 @@ def gate_loading(site: Site) -> GateReport:
     tx_by_id = {t.id: t for t in site.transformers}
     srcs = {s_.id: s_ for s_ in list(site.machines) + list(site.converters)}
 
-    def s_load(buses):
-        p = sum(ld.p_mw for ld in site.loads if ld.bus in buses)
-        q = sum(ld.q_mvar for ld in site.loads if ld.bus in buses)
+    def s_load(buses, isl):
+        loads = [(p, q) for ld, p, q in site.state_loads(isl) if ld.bus in buses]
+        p, q = sum(x for x, _ in loads), sum(y for _, y in loads)
         return (p * p + q * q) ** 0.5
 
     for isl in site.islands:
@@ -1008,12 +1008,12 @@ def gate_loading(site: Site) -> GateReport:
         find = _sections(site, isl)
         energized = [srcs[i] for i in isl.energized_source_ids if i in srcs]
         roots = {find(s_.bus) for s_ in energized}
-        for r in roots:
+        for r in sorted(roots):
             buses = {b.id for b in site.buses if find(b.id) == r}
             here = [s_ for s_ in energized if s_.bus in buses]
             total = sum(s_.s_rated_mva for s_ in here)
             sustained = sum(s_.s_rated_mva for s_ in here if not getattr(s_, "energy_mwh", None))
-            load = s_load(buses)
+            load = s_load(buses, isl)
             label = f"{isl.id}/loading({_zone_name(site, buses)})"
             if load > total * 1.0 + 1e-9:
                 rep.findings.append(Finding("loading", Severity.FAIL,
@@ -1038,7 +1038,7 @@ def gate_loading(site: Site) -> GateReport:
                     side = {b.id for b in site.buses if cut(b.id) == cut(end)}
                     if side == buses or any(s_.bus in side for s_ in here):
                         continue
-                    behind = s_load(side)
+                    behind = s_load(side, isl)
                     if behind > tx.s_rated_mva * 1.0 + 1e-9:
                         rep.findings.append(Finding("loading", Severity.FAIL,
                             f"{tx.id} ({tx.s_rated_mva:g} MVA) feeds {behind:.2f} MVA of load on a side with "

@@ -423,6 +423,11 @@ class IslandConfig(BaseModel):
         description="Normally open switches this state closes (a tie, an alternate leg after a "
                     "transfer). A normally open switch not listed here is open.")
     grid_connected: bool
+    load_factors: dict[str, float] = Field(
+        default_factory=dict,
+        description="Load id -> the factor on its p and q in this state: a load transfer a Site's fixed loads "
+                    "cannot express - the dual-corded halls' cord-A load doubling when board B is lost "
+                    "({'IT_cordA': 2.0}). Loads not listed run at 1.")
     settings_group: str = Field(
         "A", description="The protection settings group the relays run in this state (black start, "
                          "islanded and grid-connected states typically differ).")
@@ -460,6 +465,11 @@ class Site(BaseModel):
 
     def source_ids(self) -> set[str]:
         return {c.id for c in self.converters} | {m.id for m in self.machines}
+
+    def state_loads(self, isl: "IslandConfig") -> list[tuple["Load", float, float]]:
+        """Each load with its p and q in a state: its own, times the state's load factor for it."""
+        return [(ld, ld.p_mw * isl.load_factors.get(ld.id, 1.0), ld.q_mvar * isl.load_factors.get(ld.id, 1.0))
+                for ld in self.loads]
 
     def open_switch_ids(self, isl: "IslandConfig") -> set[str]:
         """The switches open in a state: those it opens, and the normally open ones it does not close."""
@@ -524,6 +534,12 @@ class Site(BaseModel):
             for swid in list(isl.open_switches) + list(isl.closed_switches):
                 if swid not in switch_ids:
                     problems.append(f"island {isl.id!r} references unknown switch {swid!r}")
+            load_ids = {ld.id for ld in self.loads}
+            for lid, k in isl.load_factors.items():
+                if lid not in load_ids:
+                    problems.append(f"island {isl.id!r} scales unknown load {lid!r}")
+                if k < 0:
+                    problems.append(f"island {isl.id!r} scales load {lid!r} by a negative factor {k:g}")
             both = set(isl.open_switches) & set(isl.closed_switches)
             if both:
                 problems.append(f"island {isl.id!r} both opens and closes {sorted(both)}")

@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.9 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.10 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -30,7 +30,7 @@ Run the demonstration:
 ```bash
 pip install pydantic numpy scipy pyyaml
 python examples/demo.py
-python -m pytest tests/ -q      # 76 tests; 8 skip without the Banshee data (set BANSHEE_DATA)
+python -m pytest tests/ -q      # 77 tests; 8 skip without the Banshee data (set BANSHEE_DATA)
 ```
 
 ## Three design decisions worth arguing about
@@ -98,6 +98,14 @@ rating on a side with no source of its own. It reasons on ratings, not a load
 flow, so a PASS is necessary, not sufficient. `gate_units` now also checks a
 transformer's reactance on its own rating (0.02-0.25 pu): a value given on the
 site's base -- x 1.0 for 6 % on 3 MVA at a 50 MVA base -- is caught.
+
+A state can also move load (v0.6.10): `IslandConfig.load_factors` maps a load
+id to the factor on its p and q in that state - the dual-corded halls' cord-A
+load doubling when board B is lost - the load transfer a Site's fixed loads
+cannot otherwise express. `Site.state_loads` gives each state's loads, and the
+loading, forming and energisation gates and the runner sum them; a factor for
+an unknown load, or a negative one, is refused. On the C003 ring it puts both
+cords' 26.3 MVA through TR_IT_A when MVB is lost (752 %).
 
 Every gate reads a state's switches the same way (`Site.open_switch_ids`): a
 switch is open if the state lists it in `open_switches`, or if it is marked
