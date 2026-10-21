@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.6 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.7 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -30,7 +30,7 @@ Run the demonstration:
 ```bash
 pip install pydantic numpy scipy pyyaml
 python examples/demo.py
-python -m pytest tests/ -q      # 66 tests; 7 skip without the Banshee data packs
+python -m pytest tests/ -q      # 67 tests; 8 skip without the Banshee data (set BANSHEE_DATA)
 ```
 
 ## Three design decisions worth arguing about
@@ -110,6 +110,22 @@ genset on the whole 30 MW site instead of the 15 MW it actually reaches. A
 state cannot both open and close one switch. The energisation gate FAILs a
 step whose transformer no energised source reaches ("the step energises
 nothing"), so a state that forgets to close a leg is caught rather than passed.
+
+## Banshee transformer ratings (v0.6.7)
+
+The units gate's reactance check (v0.6.4) found that `compose_banshee` had
+copied each MATPOWER branch's pu impedance - on the 20 MVA system base - into
+`Transformer.x_pu`, which is on the transformer's own rating, and had paired
+the branches with the .mdl's kVA ratings in list order ("they feed no gate";
+since v0.6.4 they do). It now pairs the .m's transformer branches with the .mdl's instances by impedance (one-to-one within each voltage class, ties in order) and rebases their pu impedance to the paired unit's own rating. The .mdl's Z% and X/R make the
+pairing exact for 19 of the 22 branches: XTX_3_4, for one, is the 500 kVA unit
+its x 1.96 says, not the 2500 kVA it was given in turn. Three branches match
+no instance - TX_30_40 and TX_80_110 (x 0.2977, 13.8/0.48 kV) and TX_50_60
+(x 0.752, 4.16/0.48 kV) - and take their class's remaining unit, 32-51 %
+apart; `transformer_pairing` lists every pair and its mismatch for review.
+Every reactance is then 0.037-0.074 pu on its own rating and the units gate
+passes Banshee; the Banshee tests, which skip without the data pack, had been
+failing with it since v0.6.4.
 
 ## Stage 1: tag ingest (v0.6.6)
 

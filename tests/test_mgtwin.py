@@ -1233,3 +1233,20 @@ def test_ingest_rules_are_checked():
         TagRule(r"^X\.(?P<meas>P)$", "converter", {"P": "P"})
     with pytest.raises(ValueError, match="unknown measurement"):
         TagRule(r"^(?P<id>X)\.(?P<meas>P)$", "converter", {"P": "POWER"})
+
+
+@banshee
+def test_banshee_transformers_paired_by_impedance_on_their_own_rating():
+    """The .m's transformer branches pair with the .mdl's instances by impedance, not by order: XTX_3_4 (x 1.96 on
+    20 MVA) is a 500 kVA unit, not the 2500 kVA it was given in turn. Every reactance, rebased to its unit's rating,
+    is then a transformer's (the units gate passes); the three branches no instance matches are named."""
+    from examples.banshee_rung1 import CASE_V5, MDL, RELAYS
+    from mgtwin.banshee import compose_banshee, transformer_pairing
+    from mgtwin.gates import gate_units, Severity
+    pr = transformer_pairing(CASE_V5, MDL)
+    assert pr["TX_3_4"]["kva"] == 500.0 and pr["TX_3_4"]["mismatch"] == 0.0
+    assert sorted(k for k, v in pr.items() if v["mismatch"] > 0.05) == ["TX_30_40", "TX_50_60", "TX_80_110"]
+    site = compose_banshee(CASE_V5, relay_dir=RELAYS, mdl_path=MDL)
+    tx = {t.id: t for t in site.transformers}
+    assert tx["XTX_3_4"].s_rated_mva == 0.5 and abs(tx["XTX_3_4"].x_pu - 0.049) < 1e-3
+    assert not [f for f in gate_units(site).findings if f.severity == Severity.FAIL and "reactance" in f.message]

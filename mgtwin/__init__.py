@@ -64,7 +64,7 @@ from .fault import SLGResult, slg_fault, zigzag_z0_pu
 from .runner import run_suite
 from .testrun import CaseStatus, CaseVerdict, ParamProvenance, RunReport
 
-__version__ = "0.6.6"
+__version__ = "0.6.7"
 
 __all__ = [
     "IngestReport",

@@ -33,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import openpyxl
+from scipy.optimize import linear_sum_assignment
 
 from .matpower_io import parse_matpower_m
 from .mdl_io import extract_transformers
@@ -105,6 +106,73 @@ def _read_relays(xlsx: Path, feeder: str) -> list[dict]:
     return out
 
 
+def _instance_x_sys(inst, s_base_mva: float) -> float:
+    """An .mdl instance's reactance from its own Z% and X/R, on the system base."""
+    x_own = inst.z_pct / 100.0 * inst.xr / (1.0 + inst.xr ** 2) ** 0.5
+    return x_own * s_base_mva / (inst.kva / 1e3)
+
+
+def _pair_by_impedance(branches, kv_of, insts, s_base_mva: float):
+    """
+    Pair the .m's transformer branches with the .mdl's physical instances: within each voltage class, the
+    one-to-one assignment minimising the summed |log(x_branch / x_instance)|, both on the system base.
+    Returns (branch id -> instance, branch id -> relative mismatch for pairs more than 5 % apart).
+    """
+    by_class: dict[tuple[float, float], list] = {}
+    for t in insts:
+        by_class.setdefault((t.vp_v / 1e3, t.vs_v / 1e3), []).append(t)
+    rows: dict[tuple[float, float], list] = {}
+    for br in branches:
+        if br.id.startswith("TX_"):
+            kf, kt = kv_of[int(br.from_bus[1:])], kv_of[int(br.to_bus[1:])]
+            rows.setdefault((max(kf, kt), min(kf, kt)), []).append(br)
+    paired, mismatch = {}, {}
+    for cls, brs in rows.items():
+        pool = by_class.get(cls, [])
+        if not pool:
+            continue
+        cost = np.array([[abs(np.log(br.x_pu / _instance_x_sys(t, s_base_mva))) for t in pool] for br in brs])
+        ri, ci = linear_sum_assignment(cost)
+        col = dict(zip(ri.tolist(), ci.tolist()))
+        # Ties (identical branches, identical units) go in order - earlier branch, earlier instance: swap any
+        # two pairs out of order when the swap leaves the total cost unchanged.
+        swapped = True
+        while swapped:
+            swapped = False
+            for a in sorted(col):
+                for b in sorted(col):
+                    if a < b and col[a] > col[b] and abs(cost[a, col[b]] + cost[b, col[a]]
+                                                         - cost[a, col[a]] - cost[b, col[b]]) < 1e-12:
+                        col[a], col[b] = col[b], col[a]
+                        swapped = True
+        for r, c in sorted(col.items()):
+            paired[brs[r].id] = pool[c]
+            m = abs(brs[r].x_pu / _instance_x_sys(pool[c], s_base_mva) - 1.0)
+            if m > 0.05:
+                mismatch[brs[r].id] = round(float(m), 4)
+    return paired, mismatch
+
+
+def transformer_pairing(case_path: str | Path, mdl_path: str | Path) -> dict[str, dict]:
+    """
+    For review: each transformer branch of the .m, the .mdl instance paired with it and the impedance
+    mismatch. On case v5 all but three branches match an instance exactly; three match none and take their
+    class's remaining unit: the two 13.8/0.48 kV branches of x 0.2977 (TX_30_40 a 2500 kVA, 32 % apart;
+    TX_80_110 the 5000 kVA, 51 %) and the 4.16/0.48 kV TX_50_60 (x 0.752, the 1500 kVA's, against the
+    remaining 1000 kVA, 33 %). The .m and the .mdl disagree there; the rating is the .mdl's.
+    """
+    mpc = parse_matpower_m(case_path)
+    kv_of = {int(b[0]): float(b[9]) for b in mpc["bus"]}
+    branches = [Branch(id=(f"TX_{int(r[0])}_{int(r[1])}" if kv_of[int(r[0])] != kv_of[int(r[1])] else
+                           f"LN_{int(r[0])}_{int(r[1])}"), from_bus=f"B{int(r[0])}", to_bus=f"B{int(r[1])}",
+                       r_pu=float(r[2]), x_pu=float(r[3]), b_pu=float(r[4]), s_base_mva=mpc["baseMVA"],
+                       v_base_kv=13.8, rating_mva=float(r[5]) if r[5] > 0 else mpc["baseMVA"])
+                for r in mpc["branch"]]
+    insts = [t for t in extract_transformers(mdl_path) if not t.is_hil_artifact]
+    paired, mismatch = _pair_by_impedance(branches, kv_of, insts, mpc["baseMVA"])
+    return {bid: {"instance": t.name, "kva": t.kva, "mismatch": mismatch.get(bid, 0.0)} for bid, t in paired.items()}
+
+
 def compose_banshee(
     case_path: str | Path,
     relay_dir: str | Path | None = None,
@@ -138,10 +206,10 @@ def compose_banshee(
     # when winding data is available from the OPAL-RT model (mdl_path):
     # the .m carries no winding configurations, the .mdl carries them
     # explicitly ("XFR DYg-30 HIL" = delta primary / grounded-wye secondary).
-    # Instance-to-branch pairing is by voltage class; every extracted physical
-    # instance is DYg, so the grounding-relevant fact does not depend on
-    # per-instance rating assignment, and ratings are class-matched
-    # best-effort (they feed no gate).
+    # Instance-to-branch pairing is within a voltage class, by impedance
+    # (_pair_by_impedance). The rating feeds the units (reactance) and loading
+    # gates, so Transformer.x_pu / r_pu are the branch's, rebased to the
+    # paired instance's own rating.
     branches: list[Branch] = []
     for i, row in enumerate(branch_m):
         f, t = int(row[0]), int(row[1])
@@ -166,10 +234,7 @@ def compose_banshee(
         insts = [
             t for t in extract_transformers(mdl_path) if not t.is_hil_artifact
         ]
-        # class -> instances, for best-effort rating assignment
-        by_class: dict[tuple[float, float], list] = {}
-        for t in insts:
-            by_class.setdefault((t.vp_v / 1e3, t.vs_v / 1e3), []).append(t)
+        paired, _ = _pair_by_impedance(branches, kv_of, insts, mpc["baseMVA"])
 
         conn_map = {
             "delta": WindingConfig.DELTA,
@@ -182,18 +247,18 @@ def compose_banshee(
             kv_f, kv_t = kv_of[int(f[1:])], kv_of[int(t[1:])]
             hv_bus, lv_bus = (f, t) if kv_f >= kv_t else (t, f)
             hv_kv, lv_kv = max(kv_f, kv_t), min(kv_f, kv_t)
-            pool = by_class.get((hv_kv, lv_kv), [])
-            inst = pool.pop(0) if pool else None
+            inst = paired.get(br.id)
+            s_mva = (inst.kva / 1e3) if inst else 1.0
             transformers.append(
                 Transformer(
                     id=f"X{br.id}",
                     hv_bus=hv_bus,
                     lv_bus=lv_bus,
-                    s_rated_mva=(inst.kva / 1e3) if inst else 1.0,
+                    s_rated_mva=s_mva,
                     hv_kv=hv_kv,
                     lv_kv=lv_kv,
-                    x_pu=br.x_pu,
-                    r_pu=br.r_pu,
+                    x_pu=br.x_pu * s_mva / mpc["baseMVA"],
+                    r_pu=br.r_pu * s_mva / mpc["baseMVA"],
                     hv_config=conn_map[inst.hv_connection]
                     if inst
                     else WindingConfig.DELTA,
