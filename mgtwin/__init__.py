@@ -3,12 +3,12 @@ mgtwin -- staged, gated authoring of microgrid digital twins.
 
 Pipeline stages, each emitting a reviewable artifact:
 
-    1. ingest      tags -> canonical entities        (not in this scaffold)
+    1. ingest      tags -> canonical entities        ingest.py
     2. compose     canonical entities -> Site        ontology.py
     3. verify      Site -> GateReport                gates.py
     4. identify    response data -> parameters + honest confidence   identify.py
     5. test        Site + TestSuite -> pass/fail      testspec.py
-    6. envelope    declared validity envelope         (not in this scaffold)
+    6. envelope    declared validity envelope         envelope.py
 
 What this scaffold deliberately does NOT do: write its own solvers. Composition
 targets OpenDSS / pandapower for unbalanced QSS and an external EMT tool for
@@ -44,8 +44,12 @@ from .gates import (
     gate_protection,
     gate_units,
     gate_energisation,
+    gate_forming,
+    gate_loading,
     run_all,
 )
+from .ingest import IngestReport, Tag, TagRule, TagStatus, compare_with_site, ingest_tags, load_rules, read_tags
+from .envelope import Envelope, IdentificationRecord, Inside, Phenomenon, Support, build_envelope
 from .identify import (
     IdentificationResult,
     MultiIdentificationResult,
@@ -60,9 +64,25 @@ from .fault import SLGResult, slg_fault, zigzag_z0_pu
 from .runner import run_suite
 from .testrun import CaseStatus, CaseVerdict, ParamProvenance, RunReport
 
-__version__ = "0.6.5"
+__version__ = "0.6.6"
 
 __all__ = [
+    "IngestReport",
+    "Tag",
+    "TagRule",
+    "TagStatus",
+    "compare_with_site",
+    "ingest_tags",
+    "load_rules",
+    "read_tags",
+    "Envelope",
+    "IdentificationRecord",
+    "Inside",
+    "Phenomenon",
+    "Support",
+    "build_envelope",
+    "gate_forming",
+    "gate_loading",
     "Base",
     "PowerSign",
     "AngleRef",

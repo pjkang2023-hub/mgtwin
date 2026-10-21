@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.5 -- rungs 1-4 complete; seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.6 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -14,7 +14,7 @@ Six pipeline stages, each emitting a reviewable artifact:
 
 | Stage | Module | Status |
 |---|---|---|
-| 1. ingest — tags to canonical entities | — | not built |
+| 1. ingest — tags to canonical entities | `ingest.py` | built (rules supplied per site) |
 | 1b. benchmark ingest — MATPOWER `.m` to matrices | `matpower_io.py` | built |
 | 1c. benchmark ingest — Simulink `.mdl` transformer/winding extraction | `mdl_io.py` | built |
 | 2. compose — canonical entities to `Site` | `ontology.py`, `banshee.py` | built |
@@ -23,14 +23,14 @@ Six pipeline stages, each emitting a reviewable artifact:
 | 5. test — `Site` + `TestSuite` to pass/fail | `testspec.py`, `testrun.py`, `runner.py` | built (RMS tier) |
 | — unbalanced phase-frame solver (radial) | `unbalanced.py` | built, IEEE-4 verified |
 | — SLG sequence fault analysis | `fault.py` | built |
-| 6. envelope — declared validity envelope | — | not built |
+| 6. envelope — declared validity envelope | `envelope.py` | built |
 
 Run the demonstration:
 
 ```bash
 pip install pydantic numpy scipy pyyaml
 python examples/demo.py
-python -m pytest tests/ -q      # 60 tests; 7 skip without the Banshee data packs
+python -m pytest tests/ -q      # 66 tests; 7 skip without the Banshee data packs
 ```
 
 ## Three design decisions worth arguing about
@@ -110,6 +110,45 @@ genset on the whole 30 MW site instead of the 15 MW it actually reaches. A
 state cannot both open and close one switch. The energisation gate FAILs a
 step whose transformer no energised source reaches ("the step energises
 nothing"), so a state that forgets to close a leg is caught rather than passed.
+
+## Stage 1: tag ingest (v0.6.6)
+
+`ingest(tags, rules)` (exported as `mgtwin.ingest_tags`) maps a SCADA or historian tag list (`read_tags`: a CSV
+with `tag` and optional `unit`, `description`, `sample_period_s`) to canonical
+entities - kind and id as the Site lists them - and measurements (P, Q, S, V,
+I, F, SOC, POS, TEMP). The rules are the site's naming convention written as
+regular expressions (`TagRule`, or `load_rules` from JSON); none are built in,
+because a convention guessed is a mapping invented. Every tag comes back
+MATCHED, UNMATCHED (no rule, or a measurement code the rule does not map),
+AMBIGUOUS (two rules disagree) or DUPLICATE, and every unit is checked against
+the measurement's dimension and scaled to the canonical unit: a kW tag for P
+is scaled by 1e-3, an A tag for P is flagged. `compare_with_site` then sets
+the entities against the composed Site: telemetry for equipment the Site does
+not hold, equipment no tag observes, and sources that cannot be identified
+from operating data - no P or F tag, or, given the caller's
+`identification_period_s`, sampled too slowly (rung 4's case C: a historian's
+1 s does not identify what a PMU does). Ingest does not compose topology:
+tags say what is measured, not what is connected.
+
+## Stage 6: the validity envelope (v0.6.6)
+
+`build_envelope(site, identifications)` declares where the twin is valid and
+`Envelope.check(state, phenomenon, load_mva=, step_pu=)` answers INSIDE,
+PROVISIONAL or OUTSIDE with the reasons. The phenomena this package
+represents (loading, RMS frequency, protection screening, grounding, static
+energisation) are SUPPORTED or PROVISIONAL - provisional while their
+parameters are assumed; those it does not (bus voltages, EMT, dispatch,
+reconnection) are OUTSIDE, with the tool that answers them. A state the Site
+does not enumerate is OUTSIDE; a state a gate FAILs is OUTSIDE for that
+gate's phenomena (a forming FAIL for all), and a site-wide FAIL - a units
+error - puts everything OUTSIDE until it clears. Load above a state's
+sustained sources is PROVISIONAL (it lasts as long as the storage), above all
+its sources OUTSIDE. An `IdentificationRecord` per source carries
+`identify_multi`'s verdict and the step amplitudes its experiments spanned: a
+step outside them is an extrapolation and PROVISIONAL. Bounds no input
+supplies - the frequency and voltage ranges the dynamic models hold over - are
+listed as undeclared, not filled in. `render()` gives the reviewable Markdown,
+`to_json()` the artifact.
 
 ## What is deliberately absent
 

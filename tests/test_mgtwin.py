@@ -1101,3 +1101,135 @@ def test_a_state_cannot_open_and_close_one_switch():
     st["closed_switches"].append("CB_NOPE")
     with pytest.raises(ValueError, match="unknown switch"):
         Site.model_validate(raw)
+
+
+# ---------------------------------------------------------------------------
+# Stage 6: the validity envelope
+# ---------------------------------------------------------------------------
+
+
+def _revc_rebased():
+    site = _revc_example()
+    for tx in site.transformers:
+        tx.x_pu = 0.06
+    return site
+
+
+def test_envelope_a_site_wide_fail_puts_everything_outside():
+    from mgtwin.envelope import Inside, build_envelope
+    env = build_envelope(_revc_example())
+    assert env.site_wide_fails and "transformer reactance" in env.site_wide_fails[0]
+    verdict, why = env.check("NORMAL", "loading", load_mva=30.0)
+    assert verdict == Inside.OUTSIDE and "site-wide" in why[0]
+
+
+def test_envelope_states_gates_and_tier():
+    """The gates bound the envelope state by state; phenomena beyond the tier and states the Site does not
+    enumerate are outside; storage-carried load is provisional; assumed parameters make frequency provisional."""
+    from mgtwin.envelope import Inside, build_envelope
+    env = build_envelope(_revc_rebased())
+    assert not env.site_wide_fails
+    assert env.check("NORMAL", "loading", load_mva=37.0)[0] == Inside.INSIDE
+    assert env.check("NORMAL", "loading", load_mva=60.0)[0] == Inside.PROVISIONAL   # above 44 MVA sustained
+    assert env.check("NORMAL", "loading", load_mva=80.0)[0] == Inside.OUTSIDE       # above 77 MVA in all
+    v, why = env.check("BLACKSTART_GEN", "loading")
+    assert v == Inside.OUTSIDE and "loading" in why[0]
+    assert env.check("FAST_TRANSFER_WHOLE_SECTION", "energisation")[0] == Inside.OUTSIDE
+    assert env.check("SLOW_TRANSFER_ONE_GROUP", "energisation")[0] == Inside.PROVISIONAL  # assumed inrush
+    assert env.check("NORMAL", "emt")[0] == Inside.OUTSIDE
+    assert env.check("NORMAL", "voltage")[0] == Inside.OUTSIDE
+    assert env.check("NOT_A_STATE", "loading")[0] == Inside.OUTSIDE
+    v, why = env.check("NORMAL", "frequency", step_pu=0.3)
+    assert v == Inside.PROVISIONAL and any("assumed" in w for w in why)
+    assert any("ranges over which the dynamic models hold" in u for u in env.undeclared)
+
+
+def test_envelope_identified_amplitudes_bound_a_step():
+    """With every forming source identified over 0.1-0.5 pu steps, a 0.3 pu step is inside and a 0.65 pu step is
+    an extrapolation; protection stays provisional while ride-through is assumed."""
+    import json as _json
+    import pytest
+    from mgtwin.envelope import IdentificationRecord, Inside, build_envelope
+    from mgtwin.ontology import ConverterControl
+    site = _revc_rebased()
+    gfm = [c.id for c in site.converters if c.control != ConverterControl.GFL] + [m.id for m in site.machines]
+    recs = [IdentificationRecord(s, "identified", (0.1, 0.5), {"rp": 0.04}) for s in gfm]
+    env = build_envelope(site, recs)
+    assert env.check("NORMAL", "frequency", step_pu=0.3)[0] == Inside.INSIDE
+    v, why = env.check("NORMAL", "frequency", step_pu=0.65)
+    assert v == Inside.PROVISIONAL and "extrapolation" in why[0]
+    assert env.check("NORMAL", "protection")[0] == Inside.PROVISIONAL
+    recs[0].verdict = "structural_mismatch"
+    assert env.check("NORMAL", "frequency", step_pu=0.3)[0] == Inside.PROVISIONAL
+    d = _json.loads(build_envelope(site, recs).to_json())
+    assert d["states"]["NORMAL"]["rating_mva"] == 77.0 and d["phenomena"]["emt"]["support"] == "excluded"
+    assert "# Validity envelope" in env.render()
+    with pytest.raises(ValueError, match="unknown sources"):
+        build_envelope(site, [IdentificationRecord("NOPE", "identified", (0.1, 0.5))])
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: tag ingest
+# ---------------------------------------------------------------------------
+
+
+def _revc_rules():
+    from mgtwin.ingest import TagRule
+    return [
+        TagRule(r"^(?P<id>PCS\d+)\.(?P<meas>\w+)$", "converter", {"P_MW": "P", "Q_MVAR": "Q", "F": "F", "SOC": "SOC"}),
+        TagRule(r"^(?P<id>SOFC\d\d)_(?P<meas>KW|KVAR|HZ)$", "converter", {"KW": "P", "KVAR": "Q", "HZ": "F"}),
+        TagRule(r"^(?P<id>CB_\w+)\.POS$", "switch", measurement="POS"),
+        TagRule(r"^GEN\.(?P<meas>\w+)$", "machine", {"P": "P", "F": "F"}, id_template="GEN_BS"),
+        TagRule(r"^(?P<id>PCS1)\.P_MW$", "converter", measurement="Q"),   # a deliberately conflicting rule
+    ]
+
+
+def test_ingest_maps_scales_and_flags_tags():
+    from mgtwin.ingest import Tag, TagStatus, ingest
+    tags = [Tag("PCS2.P_MW", "MW", sample_period_s=0.02), Tag("PCS2.F", "Hz", sample_period_s=0.02),
+            Tag("SOFC01_KW", "kW", sample_period_s=1.0), Tag("SOFC01_HZ", "Hz", sample_period_s=1.0),
+            Tag("SOFC02_KW", "A"),                    # wrong unit for power
+            Tag("PCS3.TEMP_C", "degC"),               # code not in the map
+            Tag("PCS1.P_MW", "MW"),                   # two rules disagree
+            Tag("CB_TIE.POS", ""), Tag("CB_TIE.POS", ""),   # a duplicate
+            Tag("HALL7.P", "MW"),                     # no rule
+            Tag("GEN.P", "kW", sample_period_s=0.1), Tag("GEN.F", "Hz", sample_period_s=0.1)]
+    rep = ingest(tags, _revc_rules())
+    st = {r.tag.tag: r.status for r in rep.results}
+    assert st["PCS2.P_MW"] == st["SOFC01_KW"] == st["GEN.P"] == TagStatus.MATCHED
+    assert st["PCS3.TEMP_C"] == st["HALL7.P"] == TagStatus.UNMATCHED
+    assert st["PCS1.P_MW"] == TagStatus.AMBIGUOUS
+    assert [r.status for r in rep.results if r.tag.tag == "CB_TIE.POS"] == [TagStatus.MATCHED, TagStatus.DUPLICATE]
+    sofc = rep.entities[("converter", "SOFC01")]
+    assert sofc.measurements["P"].scale == 1e-3
+    bad = next(r for r in rep.results if r.tag.tag == "SOFC02_KW")
+    assert any("is current, but P is power" in n for n in bad.notes)
+    assert rep.entities[("machine", "GEN_BS")].measurements["P"].scale == 1e-3
+    assert "## Flagged tags" in rep.render() and rep.to_dict()["counts"]["ambiguous"] == 1
+
+
+def test_ingest_against_the_site():
+    """Against Rev C: telemetry for equipment the Site lacks, equipment no tag observes, and which sources can be
+    identified from operating data at a PMU-grade period."""
+    from mgtwin.ingest import Tag, compare_with_site, ingest
+    tags = [Tag("PCS2.P_MW", "MW", sample_period_s=0.02), Tag("PCS2.F", "Hz", sample_period_s=0.02),
+            Tag("SOFC01_KW", "kW", sample_period_s=1.0), Tag("SOFC01_HZ", "Hz", sample_period_s=1.0),
+            Tag("PCS9.P_MW", "MW"), Tag("PCS3.P_MW", "MW")]
+    rep = ingest(tags, _revc_rules())
+    out = {(f.id, f.message.split(":")[0]) for f in compare_with_site(rep, _revc_example(), identification_period_s=0.05)}
+    assert ("PCS9", "telemetry for equipment the Site does not hold") in out
+    assert ("PCS1", "in the Site, but no tag observes it") in out
+    assert ("PCS3", "cannot be identified from operating data") in out
+    assert ("SOFC01", "sampled too slowly to identify (needs <= 0.05 s)") in out
+    assert not any(i == "PCS2" for i, _ in out)
+
+
+def test_ingest_rules_are_checked():
+    import pytest
+    from mgtwin.ingest import TagRule
+    with pytest.raises(ValueError, match="unknown kind"):
+        TagRule(r"^(?P<id>X)$", "widget", measurement="P")
+    with pytest.raises(ValueError, match="named group 'id'"):
+        TagRule(r"^X\.(?P<meas>P)$", "converter", {"P": "P"})
+    with pytest.raises(ValueError, match="unknown measurement"):
+        TagRule(r"^(?P<id>X)\.(?P<meas>P)$", "converter", {"P": "POWER"})
