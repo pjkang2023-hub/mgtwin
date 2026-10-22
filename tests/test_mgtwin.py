@@ -1402,6 +1402,27 @@ def test_a_board_87B_does_not_protect_the_circuit_leaving_it():
     assert not mag and not both
 
 
+def test_a_backup_51_under_unit_protection_short_of_margin_is_a_warning():
+    """A 51 set above the load a circuit carries may have no margin over a converter island's fault current. Where
+    an 87L (or 87B zones on both sides) covers the breaker's circuit in the state's group, that 51 is the backup:
+    a WARN pointing at breaker failure. Under its board's 87B alone it is still the circuit's protection: FAIL."""
+    from mgtwin.ontology import ProtectionFunction as PF
+    def fails(fns):
+        rep = gate_protection(_two_bess_site(fns))
+        return ([f.message for f in rep.by_severity(Severity.FAIL) if f.scope.startswith("I1/R")],
+                [f.message for f in rep.by_severity(Severity.WARN) if f.message.startswith("backup 51")])
+    hi = PF(ansi="51", pickup_a=600.0)                      # two 5 MVA BESS give ~630 A: ratio ~1.05
+    fail, warn = fails([hi, PF(ansi="87L", zone_buses=["B1", "B2"])])
+    assert not fail and warn and "87L covers the circuit" in warn[0]
+    fail, warn = fails([hi, PF(ansi="87B", zone_buses=["B1"]), PF(ansi="87B", zone_buses=["B2"])])
+    assert not fail and warn and "87B covers the circuit" in warn[0]
+    fail, warn = fails([hi, PF(ansi="87B", zone_buses=["B1"])])
+    assert fail and not warn
+    # the unit element must be active in the state's group to make the 51 a backup
+    fail, warn = fails([hi, PF(ansi="87L", zone_buses=["B1", "B2"], groups=["G"])])
+    assert fail and not warn
+
+
 def test_envelope_a_partial_study_keeps_the_state_provisional():
     """A study that passed the cables it could compute but not the bus breakers: provisional, naming the gap, even
     on identified models; a partial study that finds a failure still puts the state outside."""

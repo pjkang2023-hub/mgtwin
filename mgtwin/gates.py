@@ -506,7 +506,10 @@ def gate_protection(site: Site) -> GateReport:
       * a closed breaker whose relay has no element active in the group is
         unprotected in that state: FAIL;
       * every phase overcurrent element with a pickup (50, 51, 67) against the
-        available fault current, with the dependability margin;
+        available fault current, with the dependability margin - FAIL short of it, unless
+        unit elements active in the group cover the breaker's circuit: the element is then
+        its backup, and a backup short of margin is a WARN (breaker failure, 50BF, is the
+        backup that does not rest on magnitude);
       * converter-dominated states: the breakers whose primary protection rests
         on magnitude alone (no 21 or 51V element, and no unit element whose
         zones cover both sides of the breaker) are named in a WARN;
@@ -583,10 +586,28 @@ def gate_protection(site: Site) -> GateReport:
                 f"{isl.id}/unset",
                 "Declare the settings once the setting study has them (pickup in primary amperes)."))
 
+        sw_ends = {sw.id: (sw.from_bus, sw.to_bus) for sw in site.switches}
+
+        def unit_covers(r, act):
+            """A unit element protects the breaker's circuit only if its zones take in both sides of the breaker
+            (a feeder's 87L, a bus section between two 87B zones) - not a board's 87B on a breaker leaving it."""
+            zone = {b for e in act if e.ansi in UNIT for b in e.zone_buses}
+            return set(sw_ends[r.switch_id]) <= zone
+
         for r, e in oc_elements:
             scope = f"{isl.id}/{r.id}" if e.notes == LEGACY_ELEMENT else f"{isl.id}/{r.id}/{e.ansi}"
             ratio = total_a / e.pickup_a
-            if ratio < 1.0:
+            backup = unit_covers(r, r.active(group))
+            if ratio < PROTECTION_MARGIN and backup:
+                units = sorted({u.ansi for u in r.active(group) if u.ansi in UNIT})
+                rep.findings.append(Finding("protection", Severity.WARN,
+                    f"backup {e.ansi} at {e.pickup_a:,.0f} A has {ratio:.2f}x pickup from the island's "
+                    f"{total_a:,.0f} A, below the {PROTECTION_MARGIN}x margin; {'/'.join(units)} covers the "
+                    f"circuit and is its primary protection",
+                    scope,
+                    "Back the unit protection up with breaker failure (50BF) or a duplicated scheme; "
+                    "a backup pickup cannot be lowered below the load it must carry."))
+            elif ratio < 1.0:
                 rep.findings.append(
                     Finding(
                         "protection",
@@ -624,14 +645,6 @@ def gate_protection(site: Site) -> GateReport:
                 )
 
         protected = [r for r in in_service if r.active(group)]
-        sw_ends = {sw.id: (sw.from_bus, sw.to_bus) for sw in site.switches}
-
-        def unit_covers(r, act):
-            """A unit element protects the breaker's circuit only if its zones take in both sides of the breaker
-            (a feeder's 87L, a bus section between two 87B zones) - not a board's 87B on a breaker leaving it."""
-            zone = {b for e in act if e.ansi in UNIT for b in e.zone_buses}
-            return set(sw_ends[r.switch_id]) <= zone
-
         magnitude_only = [r.id for r in protected
                           if not unit_covers(r, r.active(group))
                           and not any(e.ansi in NOT_MAGNITUDE - UNIT for e in r.active(group))]

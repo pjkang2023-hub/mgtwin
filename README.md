@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.10 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.11 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -119,7 +119,7 @@ state cannot both open and close one switch. The energisation gate FAILs a
 step whose transformer no energised source reaches ("the step energises
 nothing"), so a state that forgets to close a leg is caught rather than passed.
 
-## Protection: what mgtwin declares and screens, what a study decides (v0.6.8-v0.6.9)
+## Protection: what mgtwin declares and screens, what a study decides (v0.6.8-v0.6.11)
 
 The split: the Site is the single record of the breakers and the relay
 settings installed on them; mgtwin screens those settings from ratings; a
@@ -141,7 +141,11 @@ group, so earlier Sites read unchanged. Each state names its
 in its group: a closed breaker with no element active is unprotected (FAIL -
 the black-start group a relay was never given); every 50/51/67 pickup against
 the available converter-limited fault current with the 1.5x dependability
-margin (FAIL); in a converter-dominated state, the breakers whose primary
+margin (FAIL) - unless unit elements active in the group cover the
+breaker's circuit, when the overcurrent is that circuit's backup and a backup
+short of margin is a WARN pointing at breaker failure (v0.6.11: a pickup set
+above the load an arm carries cannot also see a black-start island's few
+hundred amperes, and need not when 87L/87B protect it); in a converter-dominated state, the breakers whose primary
 protection rests on magnitude alone are named (WARN), and a PASS when none
 does - a unit element counts for a breaker only when its zones take in both
 sides of it (a feeder's 87L, a bus section between two 87B zones), not a
