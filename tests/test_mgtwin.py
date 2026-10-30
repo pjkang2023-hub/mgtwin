@@ -1001,6 +1001,58 @@ def test_energisation_gate_fails_whole_section_and_passes_one_at_a_time():
     assert by["SLOW_TRANSFER_ONE_GROUP"] in (Severity.PASS, Severity.WARN)
 
 
+def _ramp_site(groups, mode="ramp", open_switches=(), sources=("PCS",)):
+    """A PCS on bus A, `groups` 2.5 MVA group transformers on bus B beyond a tie, 0.7 MVA of cable charging on B."""
+    from mgtwin import Branch, Transformer, WindingConfig
+    txs = [Transformer(id="TX_PCS", hv_bus="A", lv_bus="PCS_LV", s_rated_mva=5.5, hv_kv=33.0, lv_kv=0.69, x_pu=0.06,
+                       hv_config=WindingConfig.DELTA, lv_config=WindingConfig.WYE_UNGROUNDED)]
+    txs += [Transformer(id=f"TX{i}", hv_bus="B", lv_bus=f"G{i}", s_rated_mva=2.5, hv_kv=33.0, lv_kv=0.4, x_pu=0.05,
+                        hv_config=WindingConfig.DELTA, lv_config=WindingConfig.WYE_GROUNDED) for i in range(groups)]
+    return _minimal_site(
+        buses=[Bus(id="A", v_nom_kv=33.0), Bus(id="B", v_nom_kv=33.0), Bus(id="PCS_LV", v_nom_kv=0.69),
+               Bus(id="STUB", v_nom_kv=33.0)] + [Bus(id=f"G{i}", v_nom_kv=0.4) for i in range(groups)],
+        branches=[Branch(id="CHG", from_bus="B", to_bus="STUB", r_pu=0.0, x_pu=0.001, b_pu=0.014, s_base_mva=50.0,
+                         v_base_kv=33.0, rating_mva=1.0)],
+        switches=[Switch(id="TIE", from_bus="A", to_bus="B")],
+        transformers=txs,
+        converters=[Converter(id="PCS", bus="PCS_LV", s_rated_mva=5.5, control=ConverterControl.GFM_DROOP,
+                              params=ConverterParams(p_f_droop_pu=0.04))],
+        islands=[IslandConfig(id="RAMP", grid_connected=False, energized_source_ids=list(sources),
+                              open_switches=list(open_switches), energise_mode=mode,
+                              energise_transformer_ids=[t.id for t in txs])],
+    )
+
+
+def test_ramp_energisation_judges_magnetising_and_charging_not_inrush():
+    """v0.6.12: a voltage-ramp step has no inrush - ten 2.5 MVA groups and a 5.5 MVA station transformer (0.61 MVA
+    magnetising at 2 %) plus 0.7 MVA of charging on one 5.5 MVA PCS is 0.24: PASS. Switched in, the same step FAILs."""
+    from mgtwin.gates import gate_energisation
+    ramp = gate_energisation(_ramp_site(10)).findings
+    assert [f.severity for f in ramp] == [Severity.PASS]
+    assert "ratio 0.24" in ramp[0].message and "inrush" not in ramp[0].message
+    site = _ramp_site(10, mode="switch")
+    site.islands[0].energise_transformer_ids = [f"TX{i}" for i in range(10)]     # from the live station
+    switched = gate_energisation(site).findings
+    assert any(f.severity == Severity.FAIL and "inrush" in f.message for f in switched)
+
+
+def test_ramp_energisation_fails_over_the_permissive():
+    """Sixty groups on one station: 3.11 MVA magnetising + 0.7 charging is 0.69 of 5.5 MVA - over the 0.5 permissive."""
+    from mgtwin.gates import gate_energisation
+    f, = gate_energisation(_ramp_site(60)).findings
+    assert f.severity == Severity.FAIL and "ratio 0.69" in f.message
+
+
+def test_ramp_energisation_fails_transformers_the_ramp_cannot_reach():
+    """The tie open: the groups beyond it are in a section with no forming source - the step never energises them,
+    whatever the forming capacity on the other side (CAMPAIGN-003 breaker-and-a-half cells)."""
+    from mgtwin.gates import gate_energisation
+    rep = gate_energisation(_ramp_site(4, open_switches=["TIE"])).findings
+    by = {f.severity for f in rep}
+    assert Severity.FAIL in by and Severity.PASS in by
+    assert any("never reaches" in f.message and "TX0" in f.message for f in rep if f.severity == Severity.FAIL)
+
+
 def _revc_example():
     return Site.model_validate_json((Path(__file__).resolve().parent.parent / "examples" / "c003_revC_site.json").read_text())
 

@@ -437,6 +437,12 @@ class IslandConfig(BaseModel):
         description="Transformers switched in SIMULTANEOUSLY in this state (one ATS step, one "
                     "black-start step). The energisation gate checks their summed inrush "
                     "against the grid-forming current headroom of the section they land in.")
+    energise_mode: Literal["switch", "ramp"] = Field(
+        "switch",
+        description="'switch': energise_transformer_ids are switched in from the live side (inrush against the "
+                    "forming headroom). 'ramp': they are connected dead and the section's forming sources ramp "
+                    "the voltage from zero - no inrush; the check is magnetising + charging + connected load "
+                    "against the forming rating in the section they ramp.")
 
 
 class Site(BaseModel):

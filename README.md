@@ -1,6 +1,6 @@
 # mgtwin
 
-Staged, gated authoring of microgrid digital twins. v0.6.11 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
+Staged, gated authoring of microgrid digital twins. v0.6.12 -- rungs 1-4 complete; all six stages built (ingest and envelope in v0.6.6); seven gates, including loading (v0.6.4). Rung 4's adversarial identification battery measured a 33% false-confidence rate in the single-experiment protocol and drove the multi-amplitude consistency upgrade that closed it to 0%.
 
 The wedge is microgrid controller pre-compliance screening, built against
 reference networks rather than site data. Two properties of the domain make
@@ -118,6 +118,21 @@ genset on the whole 30 MW site instead of the 15 MW it actually reaches. A
 state cannot both open and close one switch. The energisation gate FAILs a
 step whose transformer no energised source reaches ("the step energises
 nothing"), so a state that forgets to close a leg is caught rather than passed.
+
+A black-start step can also ramp rather than switch (v0.6.12):
+`IslandConfig.energise_mode` is `"switch"` (the default: `energise_transformer_ids`
+are switched in from a live side, inrush against the forming headroom) or
+`"ramp"` - the transformers are connected dead and the forming sources ramp the
+voltage from zero, so there is no inrush. Per section the ramp reaches (every
+transformer in it connected), the gate sets the magnetising current of every
+transformer in it (2 %, ASSUMED) plus its branches' charging against the forming
+sources energised in that section: FAIL above 0.5 of their rating, WARN above
+0.3. Load left connected is named but is the loading gate's to judge. A listed
+transformer in a section with no forming source FAILs - the ramp never reaches
+it. The mode comes from the C003 owner's v0.6.4 branch, which summed the whole
+site's charging and every forming source whatever the ramp reached; counting
+per section is what shows a breaker-and-a-half cell whose open breakers leave
+half its elements dead.
 
 ## Protection: what mgtwin declares and screens, what a study decides (v0.6.8-v0.6.11)
 

@@ -888,6 +888,9 @@ def gate_energisation(site: Site) -> GateReport:
     for isl in site.islands:
         if not isl.energise_transformer_ids:
             continue
+        if isl.energise_mode == "ramp":
+            _ramp_energisation(site, isl, rep)
+            continue
         opened = site.open_switch_ids(isl)
         open_pairs = {frozenset((sw_by_id[i].from_bus, sw_by_id[i].to_bus)) for i in opened}
         parent = {b.id: b.id for b in site.buses}
@@ -959,6 +962,60 @@ def gate_energisation(site: Site) -> GateReport:
             else:
                 rep.findings.append(Finding("energisation", Severity.PASS, msg, label))
     return rep
+
+
+#: Magnetising current of a transformer at rated voltage, per unit of its rating (ASSUMED).
+MAGNETISING_PU = 0.02
+#: Voltage-ramp permissive: the section's need against its forming rating - FAIL above, WARN above RAMP_WARN.
+RAMP_LIMIT, RAMP_WARN = 0.5, 0.3
+
+
+def _ramp_energisation(site: Site, isl, rep: GateReport) -> None:
+    """
+    A voltage-ramp step (energise_mode 'ramp'): the listed transformers are connected dead and the forming sources
+    ramp the voltage from zero, so there is no inrush. Per section the ramp reaches - every transformer in it
+    connected - the forming sources (grid-forming converters and machines energised in it) carry the magnetising
+    current of every transformer whose HV side is in it and the charging of its branches, against RAMP_LIMIT of
+    their rating. Load the state leaves connected is named, not counted: it rises with the voltage and is the
+    loading gate's to judge. A section holding listed transformers but no forming source is never ramped: the step
+    energises nothing there.
+    """
+    find = _sections(site, isl)
+    tx_by_id = {t.id: t for t in site.transformers}
+    energized = set(isl.energized_source_ids)
+    txs = [tx_by_id[t] for t in isl.energise_transformer_ids if t in tx_by_id]
+    for r in sorted({find(tx.hv_bus) for tx in txs}):
+        buses = {b.id for b in site.buses if find(b.id) == r}
+        listed = [tx for tx in txs if tx.hv_bus in buses]
+        label = f"{isl.id}/ramp({_zone_name(site, buses)})"
+        cap = (sum(c.s_rated_mva for c in site.converters
+                   if c.id in energized and c.bus in buses and c.control != ConverterControl.GFL)
+               + sum(m.s_rated_mva for m in site.machines if m.id in energized and m.bus in buses))
+        if cap <= 0:
+            rep.findings.append(Finding("energisation", Severity.FAIL,
+                f"{', '.join(tx.id for tx in listed)}: no forming source energised in the section they are "
+                f"connected to - the ramp never reaches them", label,
+                "Close the breaker that connects them to a ramping source, or energise a forming source in "
+                "their section."))
+            continue
+        ramped = [tx for tx in site.transformers if tx.hv_bus in buses]
+        mag = MAGNETISING_PU * sum(tx.s_rated_mva for tx in ramped)
+        chg = sum(abs(br.b_pu) * br.s_base_mva for br in site.branches if br.from_bus in buses)
+        load = sum((p ** 2 + q ** 2) ** 0.5 for ld, p, q in site.state_loads(isl) if ld.bus in buses)
+        need = mag + chg
+        ratio = need / cap
+        msg = (f"voltage ramp of {len(ramped)} transformer(s): magnetising {mag:.2f} MVA "
+               f"({MAGNETISING_PU:.0%} ASSUMED) + charging {chg:.2f} MVA = {need:.2f} MVA against {cap:.1f} MVA "
+               f"of forming rating (ratio {ratio:.2f}; permissive {RAMP_LIMIT:g})"
+               + (f"; {load:.2f} MVA of load connected through the ramp" if load > 0 else ""))
+        if ratio > RAMP_LIMIT:
+            rep.findings.append(Finding("energisation", Severity.FAIL, msg, label,
+                "Ramp a smaller section, or with more forming sources on line."))
+        elif ratio > RAMP_WARN:
+            rep.findings.append(Finding("energisation", Severity.WARN, msg, label,
+                "Confirm the forming units' voltage-ramp capability and the transformers' magnetising current."))
+        else:
+            rep.findings.append(Finding("energisation", Severity.PASS, msg, label))
 
 
 def _sections(site: Site, isl, without: frozenset = frozenset(), open_extra: frozenset = frozenset()):
